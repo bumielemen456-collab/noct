@@ -1,0 +1,1712 @@
+"""
+Layout builder buat Discord Components V2 -- pengganti sebagian embed di
+embeds.py buat kartu-kartu yang paling sering dilihat customer (invoice,
+pengumuman pembelian, detail produk).
+
+Kenapa modul terpisah dari embeds.py: sebuah pesan gak bisa nyampur embed
+klasik sama Components V2 -- begitu satu pesan pake LayoutView, dia gak
+boleh punya `content`/`embed` sama sekali, semuanya (teks, gambar, tombol)
+harus jadi komponen. Jadi builder di sini return `discord.ui.LayoutView`
+siap kirim (lewat `view=...`), bukan `discord.Embed`.
+
+Perbedaan visual yang perlu diinget dibanding embed lama:
+  * Gak ada "inline field" yang sejajar kayak kolom -- semua ditumpuk jadi
+    blok teks markdown (label tebal di atas, value di bawahnya).
+  * Gak ada footer/timestamp otomatis -- ditulis manual sebagai baris
+    "-# ..." (subtext markdown Discord, teks kecil abu-abu).
+  * Warna aksen tampil sebagai garis warna di sisi kiri Container, bukan
+    border penuh kayak embed.
+
+Referensi API: discord.py >= 2.6 (Container, Section, TextDisplay,
+Thumbnail, MediaGallery, Separator, LayoutView semua ada di discord.ui).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import discord
+
+from bot.core.emojis import EMOJI_ERROR, EMOJI_INFO, EMOJI_SUCCESS
+from bot.core.theme import (
+    COLOR_ACCENT,
+    COLOR_DANGER,
+    COLOR_PRIMARY,
+    COLOR_SUCCESS,
+    COLOR_WARNING,
+    FOOTER_TEXT,
+    MARK_BLOCK_EMPTY,
+    MARK_BLOCK_FULL,
+    MARK_BULLET,
+    MARK_DASH,
+    star_rating,
+)
+from bot.utils.helpers import calculate_final_price, discount_label, format_price
+from bot.utils.stock import format_stock, resolve_source
+
+
+class NoctraLayout(discord.ui.LayoutView):
+    """Layout generik satu-Container -- bungkus Container yang udah jadi
+    biar call site bisa langsung `view=components.invoice_view(...)`, mirip
+    pola lama `embed=embeds.order_invoice_embed(...)`."""
+
+    def __init__(self, container: discord.ui.Container, *, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.add_item(container)
+
+
+def _footer_line(extra: str | None = None) -> str:
+    """Subtext markdown ("-# ...") -- pengganti footer otomatis embed yang
+    gak ada di Components V2."""
+    text = FOOTER_TEXT if not extra else f"{FOOTER_TEXT}  {MARK_DASH}  {extra}"
+    return f"-# {text}"
+
+
+# -- Panel toko -----------------------------------------------------------------
+
+def shop_panel_container(
+    title: str,
+    description: str,
+    banner_url: str | None = None,
+) -> discord.ui.Container:
+    """Isi panel /settings shop_panel -- tata letak linear sesuai spek:
+    banner full-width PALING ATAS -> pemisah -> judul -> pemisah ->
+    deskripsi -> pemisah. Caller (bot.ui.views.ShopPanelView) nempelin
+    ActionRow tombol + pemisah + footer (teks credit + jam update
+    otomatis, thumbnail nempel di pojok kanan lewat Section accessory)
+    langsung SETELAH container ini di-return -- footer BUKAN di sini
+    soalnya isinya (jam) berubah tiap refresh, beda siklus hidup sama
+    banner/judul/deskripsi yang statis dari command."""
+    children: list = []
+    if banner_url:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    children.append(discord.ui.TextDisplay(f"## {title}"))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(discord.ui.TextDisplay(description))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def card_panel_container(title: str, description: str) -> discord.ui.Container:
+    """Isi panel /settings card_panel -- tombol Buat Kartu/Isi Saldo/Cek
+    Saldo ditempel sama CardPanelView (bot.ui.views), builder ini cuma isi
+    teksnya doang, pola sama kayak shop_panel_container."""
+    return discord.ui.Container(
+        discord.ui.TextDisplay(f"## {title}\n{description}"),
+        accent_colour=COLOR_PRIMARY,
+    )
+
+
+# -- Invoice ------------------------------------------------------------------
+
+def invoice_view(
+    order_row,
+    product_row,
+    payment_row,
+    bot_avatar_url: str | None = None,
+    items: list | None = None,
+) -> discord.ui.LayoutView:
+    """Struk yang dikirim begitu order ditandain selesai. `items` = baris
+    order_items; kalau order-nya multi-item / qty > 1, "Barang" nampilin
+    daftar lengkap (qty x nama). `bot_avatar_url`
+    diambil langsung dari foto profil bot -- ganti icon bot, struk ini
+    otomatis ikut ganti, gak perlu setting manual apapun."""
+    invoice_number = f"NOCTRA-{order_row['id']:06d}"
+    completed_ts = int(datetime.utcnow().timestamp())
+
+    header_text = discord.ui.TextDisplay(
+        f"## {EMOJI_SUCCESS} Invoice {invoice_number}\nMakasih udah belanja -- ini struk pembelian kamu."
+    )
+    header = (
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=bot_avatar_url))
+        if bot_avatar_url
+        else header_text
+    )
+
+    if items and (len(items) > 1 or items[0]["quantity"] > 1):
+        barang = "\n".join(
+            f"{it['quantity']}x {it['product_name']} {MARK_DASH} "
+            f"{format_price(it['line_total'], order_row['currency_label'])}"
+            for it in items[:15]
+        )
+        if len(items) > 15:
+            barang += f"\n-# ...dan {len(items) - 15} lainnya"
+        lines = [f"**Barang ({len(items)})**\n{barang}"]
+    else:
+        lines = [f"**Barang**\n{product_row['name']}"]
+    lines.append(f"**Total Bayar**\n{format_price(order_row['total_price'], order_row['currency_label'])}")
+    if payment_row:
+        lines.append(f"**Metode Bayar**\n{payment_row['name']}")
+    elif order_row["paid_with_credit"]:
+        lines.append("**Metode Bayar**\nKartu NOCTRA (Saldo Credit)")
+    lines.append(f"**Order ID**\n#{order_row['id']}")
+    lines.append(f"**Selesai**\n<t:{completed_ts}:f>")
+    detail_block = discord.ui.TextDisplay("\n\n".join(lines))
+
+    container = discord.ui.Container(
+        header,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        detail_block,
+        discord.ui.Separator(visible=False),
+        discord.ui.TextDisplay(_footer_line("Simpan ini buat catatan kamu ya")),
+        accent_colour=COLOR_SUCCESS,
+    )
+    return NoctraLayout(container, timeout=None)
+
+
+# -- Pengumuman pembelian ("Pembelian Baru") ------------------------------------
+# Versi Components V2 dengan sistem TIER berdasarkan peringkat Top Spender:
+# makin tinggi peringkat pembeli, makin spesial tampilannya. Versi embed
+# klasik lama (bot.ui.embeds.purchase_announcement_embed) masih ada sebagai
+# cadangan, tapi udah gak dipake lagi sama pemanggilnya.
+
+_GOLD = 0xF1C40F
+_SILVER = 0xB8C0CC
+_BRONZE = 0xCD7F32
+
+
+def _purchase_tier(rank: int | None) -> dict:
+    """Tentuin tampilan notifikasi dari peringkat Top Spender pembeli.
+    rank None (gak masuk leaderboard / belum ada data) = tier standar."""
+    if rank == 1:
+        return {
+            "color": _GOLD,
+            "tag": "\U0001F451  LEGEND  {dot}  TOP SPENDER #1",
+            "callout": "\U0001F451 **Penguasa puncak Top Spender NOCTRA.** Respect!",
+        }
+    if rank == 2:
+        return {
+            "color": _SILVER,
+            "tag": "\U0001F948  ELITE  {dot}  TOP SPENDER #2",
+            "callout": "\U0001F948 **Nempel ketat di podium Top Spender NOCTRA.**",
+        }
+    if rank == 3:
+        return {
+            "color": _BRONZE,
+            "tag": "\U0001F949  ELITE  {dot}  TOP SPENDER #3",
+            "callout": "\U0001F949 **Nempel ketat di podium Top Spender NOCTRA.**",
+        }
+    if rank is not None and rank <= 10:
+        return {"color": COLOR_ACCENT, "tag": "\U0001F48E  PREMIUM  {dot}  TOP 10 SPENDER", "callout": None}
+    return {"color": COLOR_SUCCESS, "tag": None, "callout": None}
+
+
+def purchase_announcement_view(
+    buyer_display: str,
+    buyer_avatar_url: str | None,
+    product_row,
+    category_type_row,
+    order_row,
+    profile: dict | None = None,
+    badge_text: str | None = None,
+    items: list | None = None,
+) -> discord.ui.LayoutView:
+    """Kartu publik "Si X baru aja beli Y" buat channel purchase-feed.
+    `items` = baris order_items; kalau lebih dari satu item, headline jadi
+    "N item" dan detail pesanan nampilin daftarnya.
+
+    `profile` = hasil bot.database.queries.leaderboard.get_spender_profile()
+    (total belanja, peringkat, dst) -- None kalau pembeli dikecualiin dari
+    leaderboard atau datanya gak ada; blok "Profil Pembeli" otomatis
+    dilewat dan tampilannya jatuh ke tier standar.
+    `badge_text` = teks badge custom pembeli dari /badge (cuma dipakai buat
+    top 1-3, sama kayak aturan badge di leaderboard).
+
+    Urutan: header (gambar produk jadi thumbnail di kanan atas) -> pemisah
+    -> detail pesanan -> pemisah -> profil pembeli (avatar pembeli jadi
+    thumbnail di kanan, sejajar blok ini) -> pemisah -> footer. Kalau blok
+    profil gak ada (pembeli dikecualiin dari leaderboard), avatar pindah
+    nempel ke blok detail pesanan biar tetep tampil."""
+    rank = profile["rank"] if profile else None
+    tier = _purchase_tier(rank)
+
+    # Teks bebas dari user/staff -- di-escape biar markdown & mention nyasar
+    # (misal nama tampilan berisi @everyone) gak ikut ke-render.
+    def _safe(text: str) -> str:
+        return discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+
+    header_lines: list[str] = []
+    if tier["tag"]:
+        tag = tier["tag"].format(dot=MARK_DASH)
+        if badge_text and rank is not None and rank <= 3:
+            tag = f"{tag}  {MARK_DASH}  {_safe(badge_text)}"
+        header_lines.append(f"-# {tag}")
+    header_lines.append(f"## {EMOJI_SUCCESS} Pembelian Baru")
+    multi = bool(items) and (len(items) > 1 or items[0]["quantity"] > 1)
+    if multi and len(items) > 1:
+        headline = f"**{len(items)} item**"
+    elif multi:
+        headline = f"**{items[0]['quantity']}x {items[0]['product_name']}**"
+    else:
+        headline = f"**{product_row['name']}**"
+    header_lines.append(f"**{_safe(buyer_display)}** baru aja beli {headline}!")
+    header_text = discord.ui.TextDisplay("\n".join(header_lines))
+    product_image = product_row["image_url"] or None
+    header = (
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=product_image))
+        if product_image
+        else header_text
+    )
+
+    def _with_avatar(block: discord.ui.TextDisplay):
+        """Tempelin avatar pembeli sebagai thumbnail di kanan `block`."""
+        if not buyer_avatar_url:
+            return block
+        return discord.ui.Section(block, accessory=discord.ui.Thumbnail(media=buyer_avatar_url))
+
+    separator = lambda: discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)  # noqa: E731
+    children: list = [header]
+
+    if tier["callout"]:
+        children.append(discord.ui.TextDisplay(f"> {tier['callout']}"))
+
+    # -- Detail pesanan
+    type_label = product_row["product_type"].replace("_", " ").title()
+    detail_lines = ["### Detail Pesanan"]
+    if multi:
+        for it in items[:10]:
+            detail_lines.append(f"{MARK_BULLET} {it['quantity']}x **{it['product_name']}**")
+        if len(items) > 10:
+            detail_lines.append(f"-# ...dan {len(items) - 10} lainnya")
+    else:
+        detail_lines.append(f"{MARK_BULLET} **Produk** : {product_row['name']}")
+    if category_type_row:
+        cat_emoji = f"{category_type_row['emoji']} " if category_type_row["emoji"] else ""
+        detail_lines.append(f"{MARK_BULLET} **Kategori** : {cat_emoji}{category_type_row['name']}")
+    detail_lines.append(f"{MARK_BULLET} **Tipe** : {type_label}")
+    detail_lines.append(
+        f"{MARK_BULLET} **Harga** : **{format_price(order_row['total_price'], order_row['currency_label'])}**"
+    )
+    detail_block = discord.ui.TextDisplay("\n".join(detail_lines))
+    children.append(separator())
+    children.append(detail_block if profile else _with_avatar(detail_block))
+
+    # -- Profil pembeli (total belanja + peringkat)
+    if profile:
+        currency = order_row["currency_label"]
+        profile_lines = [
+            "### Profil Pembeli",
+            f"{MARK_BULLET} **Total Belanja** : {format_price(profile['total_spent'], currency)}",
+            f"{MARK_BULLET} **Peringkat** : #{profile['rank']} dari {profile['total_spenders']} spender",
+        ]
+        if profile.get("tier_name"):
+            profile_lines.append(f"{MARK_BULLET} **Tier** : {_escape_text(profile['tier_name'])}")
+        profile_lines.append(f"{MARK_BULLET} **Total Pesanan** : {profile['total_orders']}")
+        if profile["gap_to_next"] is not None:
+            profile_lines.append(
+                f"{MARK_BULLET} **Naik Peringkat** : {format_price(profile['gap_to_next'], currency)} lagi"
+            )
+        elif profile["rank"] == 1:
+            profile_lines.append(f"{MARK_BULLET} **Status** : Puncak leaderboard")
+        children.append(separator())
+        children.append(_with_avatar(discord.ui.TextDisplay("\n".join(profile_lines))))
+
+    # -- Footer (polos, tanpa thumbnail)
+    ts = int(datetime.utcnow().timestamp())
+    children.append(separator())
+    children.append(discord.ui.TextDisplay(_footer_line(f"<t:{ts}:f>")))
+
+    return NoctraLayout(discord.ui.Container(*children, accent_colour=tier["color"]), timeout=None)
+
+
+# -- Detail produk --------------------------------------------------------------
+
+def product_detail_container(
+    product, fields: list, rating_summary: dict, group=None, quantity: int = 1
+) -> discord.ui.Container:
+    """Return Container aja (bukan LayoutView lengkap) -- caller (views.py)
+    yang nempelin ActionRow tombol (stepper jumlah, Tambah ke Keranjang,
+    Beli Sekarang, dst), soalnya tombol itu butuh callback yang nyambung
+    ke alur keranjang/checkout. `group` = Product Type produk ini (buat
+    nentuin sumber stok), `quantity` = jumlah yang lagi dipilih."""
+    final = calculate_final_price(product["base_price"], product["discount_type"], product["discount_value"])
+    price_text = format_price(final, product["currency_label"])
+    dlabel = discount_label(product["discount_type"], product["discount_value"])
+
+    title_line = f"## {product['emoji']} {product['name']}" if product["emoji"] else f"## {product['name']}"
+    description = product["description"] or "Belum ada deskripsi."
+    header_text = discord.ui.TextDisplay(f"{title_line}\n{description}")
+    header = (
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=product["image_url"]))
+        if product["image_url"]
+        else header_text
+    )
+
+    price_line = f"**{price_text}**"
+    if dlabel:
+        price_line += f"  {MARK_DASH}  {dlabel} (awalnya {format_price(product['base_price'], product['currency_label'])})"
+    type_label = product["product_type"].replace("_", " ").title()
+    source = resolve_source(product, group)
+    stock_text = format_stock(source, with_cost=True)
+    group_text = ""
+    if group is not None:
+        g_emoji = f"{group['emoji']} " if group["emoji"] else ""
+        group_text = f"**Product Type**\n{g_emoji}{group['name']}\n\n"
+
+    info_block = discord.ui.TextDisplay(
+        f"**Harga**\n{price_line}\n\n{group_text}**Tipe**\n{type_label}\n\n**Stok**\n{stock_text}"
+    )
+
+    children: list = [
+        header,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        info_block,
+    ]
+
+    if fields:
+        req = [f["label"] for f in fields if f["required"]]
+        opt = [f["label"] for f in fields if not f["required"]]
+        field_text = ""
+        if req:
+            field_text += "Wajib diisi: " + ", ".join(req)
+        if opt:
+            field_text += ("\n" if field_text else "") + "Opsional: " + ", ".join(opt)
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.TextDisplay(f"**Data yang Dibutuhin Pas Checkout**\n{field_text}"))
+
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    if rating_summary["total"]:
+        stars = star_rating(rating_summary["average"])
+        rating_text = f"{rating_summary['average']:.1f}/5 {MARK_DASH} {stars} {MARK_DASH} {rating_summary['total']} ulasan"
+    else:
+        rating_text = "Belum ada ulasan nih."
+    children.append(discord.ui.TextDisplay(f"**Rating**\n{rating_text}"))
+
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    subtotal = format_price(round(final * quantity, 2), product["currency_label"])
+    qty_text = f"**Jumlah**\n{quantity}x  {MARK_DASH}  Subtotal **{subtotal}**"
+    max_qty = source.max_quantity()
+    if max_qty is not None and quantity >= max_qty:
+        qty_text += "\n-# Sudah mentok di sisa stok."
+    children.append(discord.ui.TextDisplay(qty_text))
+
+    children.append(discord.ui.Separator(visible=False))
+    children.append(discord.ui.TextDisplay(_footer_line()))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+# -- Keranjang -----------------------------------------------------------------
+
+CART_PAGE_SIZE = 4
+
+
+def cart_container(
+    lines: list,
+    *,
+    line_controls,
+    summary_text: str,
+    footer_row: discord.ui.ActionRow,
+    notice: str | None = None,
+) -> discord.ui.Container:
+    """Container keranjang. `lines` = CartLine (bot.utils.checkout) buat
+    halaman ini SAJA; `line_controls(line) -> ActionRow` ngasih baris
+    tombol per item (kurang / jumlah / tambah / hapus), `summary_text`
+    ringkasan total (lihat cart_summary_text) dan `footer_row` baris
+    tombol bawah (navigasi, checkout, dst) -- tombolnya dibangun views.py
+    karena butuh callback.
+
+    Batas Discord: maksimal 40 komponen per pesan (semua yang nested
+    ikut kehitung). Per item = teks(1) + baris(1) + 4 tombol = 6, jadi 4
+    item per halaman = 24, plus header/ringkasan/footer masih aman di
+    bawah 40."""
+    children: list = []
+    head = "## \U0001F6D2 Keranjang Kamu"
+    if notice:
+        head += f"\n> {notice}"
+    children.append(discord.ui.TextDisplay(head))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if not lines:
+        children.append(discord.ui.TextDisplay("Keranjang kamu masih kosong. Yuk jelajahin toko dulu!"))
+    for line in lines:
+        text = f"**{line.name}**\n{line.quantity}x @ {format_price(line.unit_price, line.currency)}  {MARK_DASH}  **{format_price(line.line_total, line.currency)}**"
+        if line.problem:
+            text += f"\n\u26A0\uFE0F {line.problem}"
+        children.append(discord.ui.TextDisplay(text))
+        children.append(line_controls(line))
+
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(discord.ui.TextDisplay(summary_text))
+    children.append(footer_row)
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def cart_summary_text(all_lines: list, page: int, total_pages: int) -> str:
+    """Ringkasan total SELURUH keranjang (bukan cuma halaman ini)."""
+    if not all_lines:
+        return _footer_line("Belum ada item")
+    currency = all_lines[0].currency
+    total = round(sum(l.line_total for l in all_lines), 2)
+    qty = sum(l.quantity for l in all_lines)
+    summary = (
+        f"**Total ({len(all_lines)} produk, {qty} item)**\n"
+        f"**{format_price(total, currency)}**"
+    )
+    if total_pages > 1:
+        summary += f"\n-# Halaman {page + 1}/{total_pages}"
+    return summary
+
+
+# -- Sambutan Member Baru --------------------------------------------------------
+
+def welcome_container(
+    member: discord.Member,
+    title: str,
+    description: str,
+    footer_text: str,
+    banner_url: str | None = None,
+    color: int = COLOR_ACCENT,
+) -> discord.ui.Container:
+    """Card sambutan member baru -- gantiin embeds.welcome_embed() lama,
+    dipindah ke Components V2 biar tiap bagian (judul, deskripsi, tanggal
+    gabung, banner, footer) kepisah jelas pake garis Separator selebar
+    card, bukan numpuk jadi satu blok teks kayak embed klasik. Title sendiri
+    yang nempel ke thumbnail avatar member (biar avatar tetep sejajar sama
+    judulnya), deskripsi turun jadi blok sendiri full-width di bawah garis.
+
+    PENTING soal mention/ping: placeholder {mention} di title/description
+    (udah diganti jadi member.mention beneran sama _render_template() di
+    welcome.py sebelum nyampe sini) BAKAL NGE-PING beneran begitu kekirim,
+    beda sama embed klasik yang gak PERNAH ping apapun formatnya -- soalnya
+    TextDisplay di Components V2 diperlakuin kayak message content asli
+    buat urusan notifikasi (bukan kayak field embed). Nyala/mati-nya ping
+    tetep dikontrol dari LUAR fungsi ini lewat parameter `allowed_mentions`
+    pas channel.send() (lihat welcome.py._send_welcome), BUKAN dari sini --
+    biar toggle /welcome mention tetep konsisten kepake gimanapun staff
+    nulis template judul/deskripsinya sendiri."""
+    header_title = discord.ui.TextDisplay(f"## {title}")
+    header = discord.ui.Section(header_title, accessory=discord.ui.Thumbnail(media=member.display_avatar.url))
+
+    joined_at = member.joined_at or discord.utils.utcnow()
+    joined_ts = int(joined_at.timestamp())
+    join_block = discord.ui.TextDisplay(
+        f"**Bergabung**\n<t:{joined_ts}:F>  ({MARK_DASH} <t:{joined_ts}:R>)"
+    )
+
+    children: list = [
+        header,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        discord.ui.TextDisplay(description),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        join_block,
+    ]
+
+    if banner_url:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+
+    if footer_text:
+        children.append(discord.ui.Separator(visible=False))
+        # Icon footer SENGAJA gak ada (dulu ada, dicabut atas request Nikss --
+        # bikin baris footer jarak kosong gede/gak rapi soalnya Section
+        # selalu ngisi lebar penuh card). Emoji custom bisa langsung ditempel
+        # di teks footer-nya sendiri (markdown biasa, sama kayak title/desc)
+        # kalau butuh aksen visual, gak perlu icon terpisah.
+        children.append(discord.ui.TextDisplay(f"-# {footer_text}"))
+
+    return discord.ui.Container(*children, accent_colour=color)
+
+
+# -- Notifikasi Server Boost -----------------------------------------------------
+
+def boost_container(
+    member: discord.Member,
+    title: str,
+    description: str,
+    footer_text: str,
+    total_boosts: int,
+    banner_url: str | None = None,
+    color: int = COLOR_ACCENT,
+) -> discord.ui.Container:
+    """Card notifikasi server boost -- thumbnail avatar BOOSTER nempel ke
+    blok DESKRIPSI (bukan judul, beda dari welcome_container()) biar judul
+    dapet ruang penuh selebar card, gak keliatan mepet/kesempitan pas
+    disandingin thumbnail. Total boost server ditampilin sebagai blok
+    terpisah (angka doang, tanpa emoji) biar keliatan jelas kayak angka
+    "achievement", bukan numpuk di deskripsi. Soal mention/ping: sama kayak
+    welcome_container, nyala/matinya ping dikontrol dari LUAR
+    (allowed_mentions pas channel.send, lihat boost.py._send_boost), bukan
+    dari sini."""
+    title_display = discord.ui.TextDisplay(f"## {title}")
+    description_section = discord.ui.Section(
+        discord.ui.TextDisplay(description),
+        accessory=discord.ui.Thumbnail(media=member.display_avatar.url),
+    )
+
+    boost_block = discord.ui.TextDisplay(
+        f"**Total Boost Server Sekarang**\n{total_boosts:,}"
+    )
+
+    children: list = [
+        title_display,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        description_section,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        boost_block,
+    ]
+
+    if banner_url:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+
+    if footer_text:
+        children.append(discord.ui.Separator(visible=False))
+        children.append(discord.ui.TextDisplay(f"-# {footer_text}"))
+
+    return discord.ui.Container(*children, accent_colour=color)
+
+
+# -- Giveaway ---------------------------------------------------------------------
+
+_COLOR_GIVEAWAY_ENDED = 0x5A5A5A  # abu-abu netral -- giveaway berakhir gak pake warna aksen custom staff lagi
+
+
+def giveaway_container(giveaway_row, entry_count: int) -> discord.ui.Container:
+    """Card giveaway publik yang lagi AKTIF -- caller (bot.ui.views) yang
+    nempelin ActionRow tombol Join (GiveawayJoinButton), soalnya butuh
+    custom_id dinamis + gaya tombol (warna/emoji/label) yang staff atur
+    sendiri pas /giveaway create. Kartu ini di-edit-in-place tiap ada yang
+    join/leave biar jumlah peserta keliatan real-time."""
+    title_text = discord.ui.TextDisplay(f"## \U0001F389 {giveaway_row['title']}")
+
+    ends_ts = int(datetime.fromisoformat(giveaway_row["ends_at"]).timestamp())
+    info_lines = [
+        f"**Hadiah**\n{giveaway_row['prize']}",
+        f"**Jumlah Pemenang**\n{giveaway_row['winner_count']}",
+        f"**Berakhir**\n<t:{ends_ts}:F>  ({MARK_DASH} <t:{ends_ts}:R>)",
+        f"**Peserta**\n{entry_count} orang",
+        f"**Host**\n<@{giveaway_row['host_user_id']}>",
+    ]
+    if giveaway_row["win_role_id"]:
+        info_lines.append(f"**Role Hadiah**\n<@&{giveaway_row['win_role_id']}>")
+
+    children: list = [title_text]
+    if giveaway_row["description"]:
+        children.append(discord.ui.TextDisplay(giveaway_row["description"]))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(discord.ui.TextDisplay("\n\n".join(info_lines)))
+    children.append(discord.ui.Separator(visible=False))
+    children.append(discord.ui.TextDisplay(_footer_line(f"Giveaway #{giveaway_row['id']}")))
+
+    color = giveaway_row["color"] if giveaway_row["color"] is not None else COLOR_ACCENT
+    return discord.ui.Container(*children, accent_colour=color)
+
+
+def giveaway_ended_container(giveaway_row, winner_ids: list[int]) -> discord.ui.Container:
+    """Card giveaway yang UDAH berakhir -- gantiin tombol Join dengan hasil
+    pemenang. Dipake bot.utils.giveaway_actions.end_giveaway() buat
+    edit-in-place kartu yang lagi aktif jadi ini."""
+    title_text = discord.ui.TextDisplay(f"## \U0001F3C6 {giveaway_row['title']} -- Berakhir")
+
+    if winner_ids:
+        winners_text = ", ".join(f"<@{uid}>" for uid in winner_ids)
+        result_line = f"**Pemenang**\n{winners_text}"
+    else:
+        result_line = "**Pemenang**\nGak ada peserta yang valid -- giveaway ini gak ada pemenangnya."
+
+    info = discord.ui.TextDisplay(f"**Hadiah**\n{giveaway_row['prize']}\n\n{result_line}")
+
+    children = [
+        title_text,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        info,
+        discord.ui.Separator(visible=False),
+        discord.ui.TextDisplay(_footer_line(f"Giveaway #{giveaway_row['id']}")),
+    ]
+    return discord.ui.Container(*children, accent_colour=_COLOR_GIVEAWAY_ENDED)
+
+
+# -- Review publik & bukti foto -------------------------------------------------
+
+def review_card_container(
+    review_row,
+    product_row,
+    author_display: str,
+    emoji_title: str,
+    emoji_user: str,
+    emoji_product: str,
+    emoji_rating: str,
+    emoji_star_filled: str,
+    emoji_star_empty: str,
+    emoji_message: str,
+    author_avatar_url: str | None = None,
+    banner_url: str | None = None,
+    verified: bool = True,
+) -> discord.ui.Container:
+    """Kartu review publik yang diposting ke /settings reviews_channel abis
+    staff approve -- ini social proof/reputasi toko, jadi didesain buat
+    dibaca cepet: judul tebal + baris User/Product/Rating masing-masing
+    pake emoji custom di depannya (bukan field embed klasik). Emoji-nya
+    diatur staff lewat /settings review_emoji, sekali ganti kepake di semua
+    kartu review berikutnya (bukan per-review)."""
+    header_text = discord.ui.TextDisplay(f"## {emoji_title} REVIEW BARU #{review_row['id']}")
+
+    # " ".join (bukan concat langsung) SENGAJA -- jaraknya jangan ngandelin
+    # padding bawaan si emoji custom (bisa mepet/nempel kalau paddingnya
+    # tipis/gak ada), spasi eksplisit ini mastiin jaraknya konsisten
+    # gak peduli emoji apa yang staff atur lewat /settings review_emoji.
+    stars = " ".join(
+        [emoji_star_filled] * review_row["rating"] + [emoji_star_empty] * (5 - review_row["rating"])
+    )
+    detail_block = discord.ui.TextDisplay(
+        f"{emoji_user} **User** : {author_display}\n"
+        f"{emoji_product} **Product** : {product_row['name']}\n"
+        f"{emoji_rating} **Rating** : {stars}"
+    )
+    # Thumbnail avatar nempel ke blok User/Product/Rating, BUKAN ke judul --
+    # biar baris judul gak nyisain ruang kosong gede di sebelahnya (atas
+    # request Nikss). Beda dari welcome_container yang thumbnail-nya emang
+    # sengaja nempel ke judul.
+    detail_section = (
+        discord.ui.Section(detail_block, accessory=discord.ui.Thumbnail(media=author_avatar_url))
+        if author_avatar_url
+        else detail_block
+    )
+
+    children: list = [
+        header_text,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        detail_section,
+    ]
+
+    if review_row["review_text"]:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.TextDisplay(f"{emoji_message} **Pesan**\n> {review_row['review_text']}"))
+
+    # Beda dari author_avatar_url (thumbnail kecil di header): ini foto
+    # BESAR full-width, diambil dari foto yang customer kirim sendiri kalau
+    # ada, fallback ke banner default staff (/settings review_banner_image)
+    # kalau enggak.
+    banner = review_row["image_url"] or banner_url
+    if banner:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner)))
+
+    children.append(discord.ui.Separator(visible=False))
+    badge = "Pembelian Terverifikasi" if verified else "Belum Terverifikasi"
+    children.append(discord.ui.TextDisplay(_footer_line(badge)))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def testi_proof_container(
+    buyer_display: str,
+    product_name: str,
+    price_text: str,
+    testi_number: int,
+    photo_url: str,
+    emoji_title: str,
+    emoji_buyer: str,
+    emoji_product: str,
+    emoji_price: str,
+    emoji_testi: str,
+) -> discord.ui.Container:
+    """Notifikasi INTERNAL buat staff begitu foto bukti review masuk lewat
+    DM (lihat bot.cogs.review_photo) -- BEDA dari review_card_container di
+    atas yang showcase publik nunggu approve dulu; ini langsung kekirim ke
+    channel staff (/settings testi_proof_channel) pas fotonya baru aja
+    masuk, biar staff bisa langsung cross-check tanpa nunggu approval
+    flow. Foto-nya WAJIB ada (caller yang mastiin sebelum manggil ini)."""
+    header = discord.ui.TextDisplay(f"## {emoji_title} TESTI MONEY")
+
+    detail_block = discord.ui.TextDisplay(
+        f"{emoji_buyer} **Buyer** : {buyer_display}\n"
+        f"{emoji_product} **Product** : {product_name}\n"
+        f"{emoji_price} **Price** : {price_text}\n"
+        f"{emoji_testi} **Testi** : #{testi_number}"
+    )
+    detail_section = discord.ui.Section(detail_block, accessory=discord.ui.Thumbnail(media=photo_url))
+
+    container = discord.ui.Container(
+        header,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        detail_section,
+        accent_colour=COLOR_PRIMARY,
+    )
+    return container
+
+
+# -- Bukti Pengiriman Barang -------------------------------------------------
+
+def shipment_proof_container(
+    customer_display: str,
+    category: str,
+    product: str,
+    shipped_date: str,
+    status_label: str,
+    photo_url: str,
+    emoji_title: str,
+    emoji_category: str,
+    emoji_product: str,
+    emoji_date: str,
+    emoji_customer: str,
+    emoji_status: str,
+    color: int = COLOR_PRIMARY,
+) -> discord.ui.Container:
+    """Card bukti pengiriman barang -- staff-only, diposting manual lewat
+    /shipment kirim. Pola SAMA PERSIS kayak testi_proof_container di atas:
+    judul + blok detail (tiap baris punya emoji sendiri, staff yang atur
+    lewat /shipment emoji & /shipment emoji_produk -- boleh emoji custom
+    dari SERVER LAIN sekalipun, soalnya cuma disimpen apa adanya sebagai
+    kode emoji mentah, gak divalidasi harus emoji milik server ini) + foto
+    jadi thumbnail di sampingnya. `color` beda-beda sesuai status (lihat
+    STATUS_CHOICES di bot.cogs.shipment) -- hijau kalau berhasil dikirim,
+    merah kalau dibatalin, dst, biar staff bisa liat sekilas dari warnanya
+    doang."""
+    header = discord.ui.TextDisplay(f"## {emoji_title} BUKTI PENGIRIMAN BARANG")
+
+    detail_block = discord.ui.TextDisplay(
+        f"{emoji_category} **Kategori** : {category}\n"
+        f"{emoji_product} **Produk** : {product}\n"
+        f"{emoji_date} **Tanggal Pengiriman** : {shipped_date}\n"
+        f"{emoji_customer} **Customer** : {customer_display}\n"
+        f"{emoji_status} **Status Pengiriman** : {status_label}"
+    )
+    detail_section = discord.ui.Section(detail_block, accessory=discord.ui.Thumbnail(media=photo_url))
+
+    return discord.ui.Container(
+        header,
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        detail_section,
+        accent_colour=color,
+    )
+
+
+# -- Panel Dropdown Jenis Ticket ----------------------------------------------
+
+def ticket_type_panel_container(
+    *,
+    title: str,
+    description: str,
+    select_item: discord.ui.Select,
+    thumbnail_url: str | None = None,
+    banner_url: str | None = None,
+    footer_text: str | None = None,
+    footer_icon_url: str | None = None,
+    color: int = COLOR_PRIMARY,
+) -> discord.ui.Container:
+    """Card panel buka ticket -- Components V2, SENGAJA beda tata letak
+    dari /ticket panel yang lama (embed biasa) biar keliatan beda: judul
+    di atas -> pemisah -> deskripsi (sejajar thumbnail kalau diisi) ->
+    pemisah -> dropdown jenis ticket -> pemisah -> banner (kalau diisi) ->
+    pemisah -> footer (teks + ikon kecil, kalau diisi). Blok-blok yang
+    opsional (thumbnail/banner/footer) DIHILANGIN kalau gak diisi staff --
+    bukan ditampilin kosong -- biar gak ada spasi/pemisah nganggur.
+
+    `select_item` (dropdown-nya) ditempel LANGSUNG di sini lewat
+    ActionRow supaya nempel di DALAM container (bukan ngambang keluar
+    kartu), sama pola kayak GiveawayView nempelin tombol Join di
+    bot.ui.views."""
+    children: list = [
+        discord.ui.TextDisplay(f"## {title}"),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+    ]
+
+    if thumbnail_url:
+        children.append(
+            discord.ui.Section(
+                discord.ui.TextDisplay(description),
+                accessory=discord.ui.Thumbnail(media=thumbnail_url),
+            )
+        )
+    else:
+        children.append(discord.ui.TextDisplay(description))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    children.append(discord.ui.ActionRow(select_item))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if banner_url:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if footer_text or footer_icon_url:
+        footer_display = discord.ui.TextDisplay(f"-# {footer_text}" if footer_text else "-# \u200b")
+        if footer_icon_url:
+            children.append(
+                discord.ui.Section(footer_display, accessory=discord.ui.Thumbnail(media=footer_icon_url))
+            )
+        else:
+            children.append(footer_display)
+
+    return discord.ui.Container(*children, accent_colour=color)
+
+
+# -- Panel Atur Badge Leaderboard ---------------------------------------------
+
+def badge_panel_container(
+    title: str,
+    description: str,
+    thumbnail_url: str | None = None,
+    banner_url: str | None = None,
+) -> discord.ui.Container:
+    """Isi panel /badge panel -- sekarang bisa dikasih thumbnail (nempel di
+    samping judul, kayak shop_panel_container) dan banner (gambar
+    full-width di bawah teks, kayak ticket_type_panel_container) opsional.
+    Tombol Atur/Hapus Badge tetep ditempel caller (bot.ui.views.BadgePanelView)."""
+    header_text = discord.ui.TextDisplay(f"## {title}\n{description}")
+    header = (
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=thumbnail_url))
+        if thumbnail_url
+        else header_text
+    )
+
+    children: list = [header]
+    if banner_url:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def invite_panel_container(
+    title: str,
+    description: str,
+    banner_url: str | None = None,
+) -> discord.ui.Container:
+    """Isi panel /invite panel -- tata letak SENGAJA linear, beda dari
+    badge_panel_container (thumbnail nempel sejajar judul): banner (kalau
+    ada) full-width paling atas, lalu pemisah -> judul -> pemisah ->
+    deskripsi -> pemisah. Caller (bot.ui.views.InvitePanelView) nempelin
+    ActionRow tombol (Generate Link Server + Aturan Main) langsung
+    SETELAH container ini di-return, disusul pemisah lagi + footer
+    credit, biar urutan akhirnya persis: banner -> pemisah -> judul ->
+    pemisah -> deskripsi -> pemisah -> tombol -> pemisah -> footer."""
+    children: list = []
+    if banner_url:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    children.append(discord.ui.TextDisplay(f"## {title}"))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(discord.ui.TextDisplay(description))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def roblox_catalog_container(
+    panel_title: str, item, index: int, total: int
+) -> discord.ui.Container:
+    """Isi panel katalog item Roblox -- tata letak PERSIS 3 bagian yang
+    diminta: judul -> pemisah -> gambar utama -> pemisah -> info stock.
+    BEDA dari draft pertama: ini SATU panel buat BANYAK ITEM BEDA-BEDA
+    (bukan satu item banyak foto) -- makanya judul panel-nya statis
+    (+ indikator "Item X dari Y"), sedangkan nama item yang lagi
+    ditampilin ditumpuk di bagian info stock (item_title + stock_info),
+    soalnya itu yang GANTI tiap geser slide. Caller (bot.ui.views.
+    RobloxCatalogView) nempelin ActionRow tombol (Sebelumnya / Link /
+    Selanjutnya) langsung SETELAH container ini di-return -- tombol Link
+    juga ikut ganti URL/label tiap geser, soalnya tiap item link-nya
+    beda-beda."""
+    header = f"## {panel_title}"
+    if total > 1:
+        header += f"\n-# Item {index + 1} dari {total}"
+
+    children: list = [discord.ui.TextDisplay(header)]
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if item:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=item["image_url"])))
+    else:
+        children.append(discord.ui.TextDisplay("*(belum ada item di katalog ini)*"))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if item:
+        children.append(discord.ui.TextDisplay(f"### {item['item_title']}\n{item['stock_info']}"))
+    else:
+        children.append(discord.ui.TextDisplay("Tambahin item lewat `/roblox item add`."))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+# Status KHUSUS panel status toko (/storestatus khusus) -- lapisan manual di
+# atas BUKA/TUTUP otomatis, buat kondisi darurat/jaga-jaga. `message` =
+# teks bawaan kalau staff gak ngisi pesan custom.
+STORE_SPECIAL_PRESETS: dict[str, dict] = {
+    "slow": {
+        "label": "RESPON LAMBAT",
+        "color": COLOR_WARNING,
+        "tagline": "Balasan dan proses order mungkin lebih lama dari biasanya.",
+        "message": (
+            "Lagi banyak pesanan masuk, jadi balasan dan proses order bisa lebih lama dari biasanya.\n"
+            "Makasih ya sudah sabar menunggu, pesananmu tetap kami kerjakan satu per satu."
+        ),
+    },
+    "maintenance": {
+        "label": "PERBAIKAN SISTEM",
+        "color": 0xE67E22,
+        "tagline": "Order sementara belum bisa diproses.",
+        "message": (
+            "Sistem lagi kami perbaiki biar layanan makin stabil.\n"
+            "Kami kabari begitu sudah normal kembali. Makasih atas pengertiannya."
+        ),
+    },
+}
+
+
+def store_status_container(
+    state: str,
+    open_time: str,
+    close_time: str,
+    emoji_open: str,
+    emoji_closed: str,
+    note: str | None,
+    banner_url: str | None,
+    thumbnail_url: str | None,
+    ping_role_id: int | None = None,
+    *,
+    next_change_ts: int | None = None,
+    special: str | None = None,
+    special_message: str | None = None,
+    special_since: int | None = None,
+    emoji_special: str | None = None,
+) -> discord.ui.Container:
+    """Isi panel status toko (/storestatus). Urutan (semua dipisah garis):
+
+      banner -> header status (tag, judul status + indikator, satu kalimat
+      penjelas; logo toko jadi thumbnail di kanan) -> jadwal (jam
+      operasional + hitung mundur live) -> pesan (ucapan terima kasih
+      pas tutup / pesan status khusus / catatan staff) -> footer.
+
+    `state` ("open"/"closed") di-hitung OTOMATIS dari jam operasional (lihat
+    bot.utils.store_status.compute_state) -- builder ini cuma nge-render,
+    gak ada logic jam di sini. `next_change_ts` = unix timestamp kapan
+    status berikutnya berubah (bot.utils.store_status.next_change); dirender
+    sebagai timestamp relatif Discord (`<t:...:R>`) yang ngitung mundur
+    SENDIRI di sisi pembaca, jadi panel gak perlu diedit berkala.
+
+    `special` ("slow"/"maintenance") = status khusus manual yang NIMPA
+    tampilan buka/tutup (lihat STORE_SPECIAL_PRESETS); `special_message`
+    mengganti teks bawaan jenisnya, `special_since` ditampilin sebagai
+    "sejak ..." biar ketahuan kalau lupa dimatiin.
+
+    CATATAN soal `ping_role_id`: mention role di sini CUMA buat INFO VISUAL
+    -- Discord GAK ngirim notifikasi ping dari mention lewat EDIT pesan.
+    Ping asli dikirim terpisah lewat bot.utils.store_status.notify_state_ping.
+    Semua emoji dateng dari pemanggil (setting custom server) atau
+    bot.core.emojis -- gak ada emoji Unicode hardcode di sini."""
+    is_open = state == "open"
+    preset = STORE_SPECIAL_PRESETS.get(special) if special else None
+
+    if preset:
+        indicator = emoji_special or EMOJI_INFO
+        label, tagline, accent = preset["label"], preset["tagline"], preset["color"]
+    elif is_open:
+        indicator, label, accent = emoji_open, "BUKA", COLOR_SUCCESS
+        tagline = "Pesananmu langsung kami proses. Selamat berbelanja!"
+    else:
+        indicator, label, accent = emoji_closed, "TUTUP", COLOR_DANGER
+        tagline = "Toko lagi istirahat, tapi pesananmu tetap kami terima."
+
+    def separator() -> discord.ui.Separator:
+        return discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+
+    children: list = []
+
+    if banner_url:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+        children.append(separator())
+
+    # -- Header status (logo toko jadi thumbnail di kanan)
+    header_text = discord.ui.TextDisplay(
+        f"-# {FOOTER_TEXT}  \u00b7  STATUS TOKO\n## {indicator} {label}\n{tagline}"
+    )
+    children.append(
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=thumbnail_url))
+        if thumbnail_url
+        else header_text
+    )
+    children.append(separator())
+
+    # -- Jadwal: jam operasional + hitung mundur live (cuma kalau gak lagi
+    # ada status khusus -- hitung mundur ke "buka/tutup" nyesatin pas darurat)
+    schedule = [f"{MARK_BULLET} **Jam Operasional** : {open_time} \u2013 {close_time} WIB"]
+    if preset:
+        if special_since:
+            schedule.append(f"{MARK_BULLET} **Berlaku Sejak** : <t:{special_since}:R>")
+    elif next_change_ts:
+        schedule.append(f"{MARK_BULLET} **{'Tutup' if is_open else 'Buka Lagi'}** : <t:{next_change_ts}:R>")
+    children.append(discord.ui.TextDisplay("\n".join(schedule)))
+
+    # -- Pesan: status khusus / ucapan terima kasih pas tutup / catatan staff
+    message_lines: list[str] = []
+    if preset:
+        body = special_message or preset["message"]
+        message_lines.extend(f"> {line}" for line in body.splitlines() if line.strip())
+    elif not is_open:
+        message_lines.append("> Terima kasih sudah mempercayai dan berbelanja di toko kami.")
+        message_lines.append("> Semoga harimu Minggu terus.")
+    if note:
+        if message_lines:
+            message_lines.append("")
+        message_lines.append(f"{MARK_BULLET} {note}")
+    if message_lines:
+        children.append(separator())
+        children.append(discord.ui.TextDisplay("\n".join(message_lines)))
+
+    # -- Footer
+    footer_lines = []
+    if ping_role_id:
+        footer_lines.append(f"-# {EMOJI_INFO} Notifikasi buka/tutup: <@&{ping_role_id}>")
+    footer_lines.append("-# Pesanan di luar jam operasional diproses saat toko buka kembali.")
+    children.append(separator())
+    children.append(discord.ui.TextDisplay("\n".join(footer_lines)))
+
+    return discord.ui.Container(*children, accent_colour=accent)
+
+
+def welcome_dm_container(categories: list, banner_url: str | None) -> discord.ui.Container:
+    """Isi DM sambutan member baru (/welcomedm) -- tata letak PERSIS yang
+    diminta: banner -> pemisah -> judul "NOCTRA DIGITAL STORE" -> pemisah
+    -> daftar kategori produk (nama+emoji, LIVE dari /category yang
+    staff atur -- BUKAN hardcode, jadi otomatis nyambung tiap kategori
+    ditambah/diubah) -> pemisah -> footer -> pemisah. Tombol link
+    ditempel caller SETELAH container ini di-return (lihat
+    bot.cogs.welcome._send_welcome_dm), sesuai urutan yang diminta:
+    footer duluan, tombol paling akhir."""
+    children: list = []
+
+    if banner_url:
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=banner_url)))
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    children.append(discord.ui.TextDisplay("## NOCTRA DIGITAL STORE"))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    if categories:
+        entries = []
+        for cat in categories:
+            emoji = cat["emoji"] or "\U0001F4E6"
+            entry = f"{emoji} **{cat['name']}**"
+            if cat["description"]:
+                entry += f"\n-# {cat['description']}"
+            entries.append(entry)
+        category_text = "\n\n".join(entries)
+    else:
+        category_text = "*(belum ada kategori produk yang aktif)*"
+    children.append(discord.ui.TextDisplay(f"**Kategori Produk yang Tersedia:**\n\n{category_text}"))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    children.append(
+        discord.ui.TextDisplay(
+            "-# Selamat datang di Noctra Digital Store, disini kamu bisa berbelanja dengan "
+            "pengalaman terbaik dan layanan yang nyaman"
+        )
+    )
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_PRIMARY)
+
+
+def rstock_container(
+    emoji_title: str,
+    emoji_via_username: str, amount_via_username: int, price_via_username: str,
+    emoji_via_login: str, amount_via_login: int, price_via_login: str,
+    emoji_gamepass: str, amount_gamepass: int, price_gamepass: str,
+    emoji_footer: str,
+) -> discord.ui.Container:
+    """Isi auto-respon /rstock -- trigger kata kunci "rstock" di chat
+    (lihat bot.cogs.roblox_stock). Tata letak PERSIS yang diminta: judul
+    -> pemisah -> stock ROBUX (3 tipe: via Username / via Login /
+    Gamepass, tiap tipe nampilin ANGKA stock beneran + status Ready/Habis
+    otomatis, bukan teks bebas statis) -> pemisah -> footer. SETIAP
+    bagian WAJIB nempel emoji -- caller udah mastiin ada fallback emoji
+    default kalau staff belum pernah atur (lihat
+    RuntimeSettings.rstock_emoji_*), jadi gak ada parameter emoji di sini
+    yang bakal kosong."""
+
+    def _entry(emoji: str, label: str, amount: int, price: str) -> str:
+        status = "Ready \u2705" if amount > 0 else "Habis \u274c"
+        return f"{emoji} **{label}** -- {status}\nStock: **{amount}**\n{price}"
+
+    children: list = [
+        discord.ui.TextDisplay(f"## {emoji_title} STOCK ROBUX"),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        discord.ui.TextDisplay(
+            "\n\n".join([
+                _entry(emoji_via_username, "Via Username", amount_via_username, price_via_username),
+                _entry(emoji_via_login, "Via Login", amount_via_login, price_via_login),
+                _entry(emoji_gamepass, "Gamepass", amount_gamepass, price_gamepass),
+            ])
+        ),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+        discord.ui.TextDisplay(
+            f"-# {emoji_footer} Stock produk ini real-time, jadi perhatikan stock sebelum memesan ROBUX"
+        ),
+    ]
+    return discord.ui.Container(*children, accent_colour=COLOR_ACCENT)
+
+
+def payment_methods_container(methods: list) -> discord.ui.Container:
+    """Isi panel /npay -- daftar SEMUA metode pembayaran aktif (nama,
+    instruksi, emoji per-metode) yang udah diatur staff lewat command
+    payment method yang udah ada, BUKAN teks baru yang diketik ulang.
+    Gambar QR/rekening (kalau ada per-metode) digabung jadi SATU
+    MediaGallery di bawah -- MediaGallery Discord emang didesain buat
+    nampilin beberapa gambar sekaligus dalam grid, jadi semua QR/gambar
+    metode keliatan bareng tanpa perlu kirim pesan terpisah per metode."""
+    children: list = [
+        discord.ui.TextDisplay("## \U0001F4B3 Metode Pembayaran"),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+    ]
+
+    if methods:
+        entries = []
+        for method in methods:
+            emoji = method["emoji"] or "\U0001F4B0"
+            entry = f"{emoji} **{method['name']}**"
+            if method["instructions"]:
+                entry += f"\n{method['instructions']}"
+            entries.append(entry)
+        children.append(discord.ui.TextDisplay("\n\n".join(entries)))
+    else:
+        children.append(discord.ui.TextDisplay("*(belum ada metode pembayaran yang aktif)*"))
+
+    image_urls = [m["image_url"] for m in methods if m["image_url"]]
+    if image_urls:
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        children.append(discord.ui.MediaGallery(*[discord.MediaGalleryItem(media=url) for url in image_urls]))
+
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(
+        discord.ui.TextDisplay("-# Pilih salah satu metode di atas, terus konfirmasi ke staff abis transfer.")
+    )
+
+    return discord.ui.Container(*children, accent_colour=COLOR_SUCCESS)
+
+
+# -- Blacklist, profil pembeli, & tier loyalitas ------------------------------
+
+def _escape_text(text: str) -> str:
+    """Teks bebas (nama user, alasan, nama tier) -- di-escape biar markdown
+    dan mention nyasar gak ikut ke-render atau nge-ping orang."""
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(str(text)))
+
+
+def _plain_separator() -> discord.ui.Separator:
+    return discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+
+
+def blacklist_panel_container(entries: list[dict], page: int, total_pages: int, total: int) -> discord.ui.Container:
+    """Panel staff "Daftar Blacklist" (satu halaman). `entries` = dict
+    {user_id, reason, added_by, created_ts}; tombol Sebelumnya/Selanjutnya
+    ditempel pemanggil (bot.ui.blacklist_view)."""
+    header = [
+        f"-# {FOOTER_TEXT}  \u00b7  BLACKLIST",
+        f"## {EMOJI_ERROR} Daftar Blacklist",
+        f"{total} user diblokir dari order" + (f"  \u00b7  halaman {page + 1}/{total_pages}" if total_pages > 1 else ""),
+    ]
+    children: list = [discord.ui.TextDisplay("\n".join(header)), _plain_separator()]
+    if not entries:
+        children.append(discord.ui.TextDisplay("Belum ada user yang di-blacklist."))
+    else:
+        lines = []
+        for index, entry in enumerate(entries, start=1):
+            number = entry.get("number", index)  # pemanggil ngasih nomor urut global antar halaman
+            reason = _escape_text(entry["reason"])
+            reason = reason if len(reason) <= 120 else reason[:119].rstrip() + "\u2026"
+            lines.append(
+                f"{number}. <@{entry['user_id']}> (`{entry['user_id']}`)\n"
+                f"{MARK_BULLET} {reason}\n"
+                f"-# oleh <@{entry['added_by']}>  \u00b7  <t:{entry['created_ts']}:R>"
+            )
+        children.append(discord.ui.TextDisplay("\n".join(lines)))
+    return discord.ui.Container(*children, accent_colour=COLOR_DANGER)
+
+
+_STANDING_COLORS = {
+    "blacklisted": COLOR_DANGER, "attention": COLOR_WARNING, "trusted": COLOR_SUCCESS,
+    "active": COLOR_ACCENT, "new": COLOR_ACCENT,
+}
+_STANDING_EMOJI = {
+    "blacklisted": EMOJI_ERROR, "attention": EMOJI_INFO, "trusted": EMOJI_SUCCESS,
+    "active": EMOJI_SUCCESS, "new": EMOJI_INFO,
+}
+
+
+def buyer_info_container(card: dict) -> discord.ui.Container:
+    """Profil pembeli buat STAFF (/buyerinfo): status kepercayaan (dari
+    riwayat order, aturannya di bot.utils.blacklist.buyer_standing),
+    statistik order, tier loyalitas, dan alasan blacklist kalau ada.
+
+    card = {user{id,name,display_name,avatar_url,created_display,joined_display},
+    standing{key,label,summary,ratio}, blacklist{reason,added_by,created_ts}|None,
+    stats{...}, tier{current,next{name,remaining}}, currency}."""
+    user, standing, stats = card["user"], card["standing"], card["stats"]
+    currency = card.get("currency") or stats.get("currency_label") or ""
+
+    header_text = discord.ui.TextDisplay(
+        f"-# {FOOTER_TEXT}  \u00b7  PROFIL PEMBELI\n"
+        f"## {_STANDING_EMOJI[standing['key']]} {standing['label']}\n"
+        f"**{_escape_text(user['display_name'])}** (@{_escape_text(user['name'])})  \u00b7  <@{user['id']}>\n"
+        f"{standing['summary']}"
+    )
+    children: list = [
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=user["avatar_url"]))
+        if user.get("avatar_url") else header_text,
+        _plain_separator(),
+    ]
+
+    bad = stats["cancelled"] + stats["refunded"]
+    finished = stats["completed"] + bad
+    ratio_text = f"{standing['ratio'] * 100:.0f}% ({bad} dari {finished})" if finished else "belum ada"
+    order_lines = [
+        "### Riwayat Order",
+        f"{MARK_BULLET} **Selesai** : {stats['completed']}  \u00b7  **Total Belanja** : {format_price(stats['total_spent'], currency)}",
+        f"{MARK_BULLET} **Dibatalkan** : {stats['cancelled']}  \u00b7  **Refund** : {stats['refunded']}  \u00b7  **Kedaluwarsa** : {stats['expired']}",
+        f"{MARK_BULLET} **Rasio Batal/Refund** : {ratio_text}",
+    ]
+    if stats["last_order_at"]:
+        order_lines.append(f"{MARK_BULLET} **Order Terakhir** : {stats['last_order_at']} UTC")
+    children.append(discord.ui.TextDisplay("\n".join(order_lines)))
+
+    tier = card.get("tier") or {}
+    tier_lines = ["### Tier Loyalitas", f"{MARK_BULLET} **Tier Sekarang** : {_escape_text(tier['current']) if tier.get('current') else 'Belum ada'}"]
+    if tier.get("next"):
+        tier_lines.append(
+            f"{MARK_BULLET} **Tier Berikutnya** : {_escape_text(tier['next']['name'])} "
+            f"({format_price(tier['next']['remaining'], currency)} lagi)"
+        )
+    children.append(_plain_separator())
+    children.append(discord.ui.TextDisplay("\n".join(tier_lines)))
+
+    account_lines = ["### Akun Discord", f"{MARK_BULLET} **Dibuat** : {user['created_display']}"]
+    if user.get("joined_display"):
+        account_lines.append(f"{MARK_BULLET} **Join Server** : {user['joined_display']}")
+    children.append(_plain_separator())
+    children.append(discord.ui.TextDisplay("\n".join(account_lines)))
+
+    if card.get("blacklist"):
+        entry = card["blacklist"]
+        children.append(_plain_separator())
+        children.append(discord.ui.TextDisplay(
+            f"### Blacklist\n{MARK_BULLET} **Alasan** : {_escape_text(entry['reason'])}\n"
+            f"-# oleh <@{entry['added_by']}>  \u00b7  <t:{entry['created_ts']}:R>"
+        ))
+
+    return discord.ui.Container(*children, accent_colour=_STANDING_COLORS[standing["key"]])
+
+
+def _progress_bar(fraction: float, width: int = 12) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    return MARK_BLOCK_FULL * filled + MARK_BLOCK_EMPTY * (width - filled) + f"  {fraction * 100:.0f}%"
+
+
+def tier_progress_container(card: dict) -> discord.ui.Container:
+    """Kartu progres tier pembeli (/mytier). card = {display_name,
+    avatar_url, spend, currency, current{name,description}|None,
+    next{name,remaining,progress}|None, tiers[{name,min_spend,reached,
+    current}]}."""
+    currency = card.get("currency") or ""
+    current = card.get("current")
+    title = _escape_text(current["name"]) if current else "Belum Punya Tier"
+    header_lines = [
+        f"-# {FOOTER_TEXT}  \u00b7  TIER LOYALITAS",
+        f"## {EMOJI_SUCCESS if current else EMOJI_INFO} {title}",
+        f"{_escape_text(card['display_name'])}  \u00b7  Total belanja {format_price(card['spend'], currency)}",
+    ]
+    if current and current.get("description"):
+        header_lines.append(f"> {_escape_text(current['description'])}")
+    header_text = discord.ui.TextDisplay("\n".join(header_lines))
+    children: list = [
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=card["avatar_url"]))
+        if card.get("avatar_url") else header_text,
+        _plain_separator(),
+    ]
+
+    nxt = card.get("next")
+    if nxt:
+        children.append(discord.ui.TextDisplay("\n".join([
+            f"### Menuju {_escape_text(nxt['name'])}",
+            _progress_bar(nxt["progress"]),
+            f"{MARK_BULLET} Tinggal **{format_price(nxt['remaining'], currency)}** lagi.",
+        ])))
+    else:
+        children.append(discord.ui.TextDisplay(
+            "### Tier Tertinggi\nKamu sudah di puncak tier loyalitas. Terima kasih sudah jadi bagian NOCTRA!"
+            if current else "### Mulai Belanja\nBelum ada tier yang tersedia."
+        ))
+
+    if card["tiers"]:
+        lines = ["### Semua Tier"]
+        for tier in reversed(card["tiers"]):  # dari tertinggi ke terendah
+            marker = EMOJI_SUCCESS if tier["reached"] else MARK_BULLET
+            suffix = "  (tier kamu)" if tier["current"] else ""
+            lines.append(f"{marker} **{_escape_text(tier['name'])}**  \u00b7  min {format_price(tier['min_spend'], currency)}{suffix}")
+        children.append(_plain_separator())
+        children.append(discord.ui.TextDisplay("\n".join(lines)))
+    accent = COLOR_SUCCESS if current else COLOR_ACCENT
+    return discord.ui.Container(*children, accent_colour=accent)
+
+
+def tier_panel_container(tiers: list[dict], currency: str) -> discord.ui.Container:
+    """Panel publik "Tier Loyalitas" -- daftar semua tier + syaratnya.
+    tiers = [{name, role_id, min_spend, description}] urut dari terendah."""
+    lines: list[str] = []
+    for tier in reversed(tiers):
+        lines.append(f"### <@&{tier['role_id']}>\n{MARK_BULLET} **Minimal belanja** : {format_price(tier['min_spend'], currency)}")
+        if tier.get("description"):
+            lines.append(f"> {_escape_text(tier['description'])}")
+    body = "\n".join(lines) if lines else "Belum ada tier yang diatur."
+    return discord.ui.Container(
+        discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  TIER LOYALITAS\n## {EMOJI_INFO} Tier Loyalitas NOCTRA\n"
+            "Makin sering belanja, makin tinggi tier-mu. Role tier dikasih otomatis begitu total belanjamu cukup."
+        ),
+        _plain_separator(),
+        discord.ui.TextDisplay(body),
+        _plain_separator(),
+        discord.ui.TextDisplay("-# Cek progresmu kapan saja dengan /mytier"),
+        accent_colour=COLOR_ACCENT,
+    )
+
+
+def tier_up_container(card: dict) -> discord.ui.Container:
+    """DM "Naik Tier" ke pembeli. card = {name, description, spend,
+    next_name, next_remaining, currency}."""
+    currency = card.get("currency") or ""
+    lines = [
+        f"-# {FOOTER_TEXT}  \u00b7  TIER LOYALITAS",
+        f"## {EMOJI_SUCCESS} Selamat, Naik Tier!",
+        f"Kamu sekarang **{_escape_text(card['name'])}**.",
+    ]
+    if card.get("description"):
+        lines.append(f"> {_escape_text(card['description'])}")
+    children: list = [discord.ui.TextDisplay("\n".join(lines)), _plain_separator()]
+    detail = [f"{MARK_BULLET} **Total Belanja** : {format_price(card['spend'], currency)}"]
+    if card.get("next_name"):
+        detail.append(
+            f"{MARK_BULLET} **Tier Berikutnya** : {_escape_text(card['next_name'])} "
+            f"({format_price(card['next_remaining'], currency)} lagi)"
+        )
+    else:
+        detail.append(f"{MARK_BULLET} Kamu sudah di tier tertinggi.")
+    children.append(discord.ui.TextDisplay("\n".join(detail)))
+    children.append(_plain_separator())
+    children.append(discord.ui.TextDisplay("-# Terima kasih sudah mempercayai dan berbelanja di toko kami."))
+    return discord.ui.Container(*children, accent_colour=COLOR_SUCCESS)
+
+
+# -- SLA staff, statistik staff, pengingat batas bayar -------------------------
+
+_ALERT_LINES_PER_SECTION = 8
+
+
+def sla_alert_container(card: dict) -> discord.ui.Container:
+    """Pengingat staff (channel order-log): daftar yang kelamaan nunggu
+    tindakan. card = {role_id|None, sections:[{title, lines:[str]}], total,
+    round_note}. Tiap section dipotong 8 baris (+N lainnya) biar pesannya
+    gak kepanjangan."""
+    ping = f"<@&{card['role_id']}> " if card.get("role_id") else ""
+    children: list = [
+        discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  SLA STAFF\n## {EMOJI_INFO} Pengingat Staff\n"
+            f"{ping}{card['total']} hal menunggu tindakan."
+        ),
+    ]
+    for section in card["sections"]:
+        lines = section["lines"][:_ALERT_LINES_PER_SECTION]
+        if len(section["lines"]) > len(lines):
+            lines.append(f"-# ...dan {len(section['lines']) - len(lines)} lainnya")
+        children.append(_plain_separator())
+        children.append(discord.ui.TextDisplay("\n".join([f"### {section['title']}", *lines])))
+    if card.get("round_note"):
+        children.append(_plain_separator())
+        children.append(discord.ui.TextDisplay(f"-# {card['round_note']}"))
+    return discord.ui.Container(*children, accent_colour=COLOR_WARNING)
+
+
+def _fmt_secs(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    minutes = int(round(seconds) // 60)  # bulatin dulu: julianday() SQLite punya error desimal
+    if minutes < 1:
+        return "<1 menit"
+    hours, mins = divmod(minutes, 60)
+    if hours >= 24:
+        return f"{hours // 24} hari {hours % 24} jam"
+    if hours:
+        return f"{hours} jam {mins} mnt" if mins else f"{hours} jam"
+    return f"{mins} menit"
+
+
+def staff_stats_container(card: dict) -> discord.ui.Container:
+    """Statistik staff (/staffstats). Dua bentuk:
+      mode "overview": card = {mode, period, rows:[{staff_id, completed, paid,
+        shipments, claimed, median_handle, median_response, responses}], totals}
+      mode "detail": card = {mode, period, staff{id,name,display_name,avatar_url},
+        stats{...sama...}}
+    Median dipake (bukan rata-rata) biar satu order yang nyangkut lama gak
+    ngerusak angka."""
+    period = card["period"]
+    footnote = (
+        "-# Order dicatat sejak fitur ini dipasang. Pengiriman dan claim ticket diambil dari data lama."
+    )
+    if card["mode"] == "detail":
+        staff, st = card["staff"], card["stats"]
+        header_text = discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  STATISTIK STAFF  \u00b7  {period.upper()}\n"
+            f"## {EMOJI_INFO} {_escape_text(staff['display_name'])}\n<@{staff['id']}>"
+        )
+        children: list = [
+            discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=staff["avatar_url"]))
+            if staff.get("avatar_url") else header_text,
+            _plain_separator(),
+            discord.ui.TextDisplay("\n".join([
+                "### Order",
+                f"{MARK_BULLET} **Diselesaikan** : {st['completed']}",
+                f"{MARK_BULLET} **Pembayaran Diverifikasi** : {st['paid']}",
+                f"{MARK_BULLET} **Dibatalkan / Refund** : {st['cancelled']} / {st['refunded']}",
+                f"{MARK_BULLET} **Median Waktu Proses** : {_fmt_secs(st['median_handle'])}  (lunas \u2192 selesai)",
+            ])),
+            _plain_separator(),
+            discord.ui.TextDisplay("\n".join([
+                "### Ticket & Pengiriman",
+                f"{MARK_BULLET} **Ticket Di-claim** : {st['claimed']}",
+                f"{MARK_BULLET} **Respon Pertama** : {st['responses']} ticket  \u00b7  median {_fmt_secs(st['median_response'])}",
+                f"{MARK_BULLET} **Bukti Pengiriman** : {st['shipments']}",
+            ])),
+            _plain_separator(),
+            discord.ui.TextDisplay(footnote),
+        ]
+        return discord.ui.Container(*children, accent_colour=COLOR_ACCENT)
+
+    lines = []
+    for index, row in enumerate(card["rows"], start=1):
+        lines.append(
+            f"{index}. <@{row['staff_id']}>  \u00b7  **{row['completed']}** selesai  \u00b7  "
+            f"**{row['paid']}** verifikasi\n"
+            f"-# proses {_fmt_secs(row['median_handle'])}  \u00b7  respon ticket {_fmt_secs(row['median_response'])}"
+            f"  \u00b7  kirim {row['shipments']}  \u00b7  claim {row['claimed']}"
+        )
+    body = "\n".join(lines) if lines else "Belum ada aktivitas staff di periode ini."
+    totals = card["totals"]
+    return discord.ui.Container(
+        discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  STATISTIK STAFF  \u00b7  {period.upper()}\n"
+            f"## {EMOJI_INFO} Performa Staff\n"
+            f"{totals['completed']} order selesai  \u00b7  {totals['paid']} pembayaran diverifikasi"
+        ),
+        _plain_separator(),
+        discord.ui.TextDisplay(body),
+        _plain_separator(),
+        discord.ui.TextDisplay(footnote),
+        accent_colour=COLOR_ACCENT,
+    )
+
+
+def pay_reminder_container(card: dict) -> discord.ui.Container:
+    """DM pengingat ke pembeli: order belum dibayar, batas bayar hampir
+    habis. card = {order_id, amount, currency, deadline_ts}."""
+    return discord.ui.Container(
+        discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  PENGINGAT PEMBAYARAN\n"
+            f"## {EMOJI_INFO} Order #{card['order_id']} Belum Dibayar\n"
+            f"Batas pembayaran berakhir <t:{card['deadline_ts']}:R> (<t:{card['deadline_ts']}:t>)."
+        ),
+        _plain_separator(),
+        discord.ui.TextDisplay(
+            f"{MARK_BULLET} **Total** : {format_price(card['amount'], card['currency'] or '')}\n"
+            f"{MARK_BULLET} Kirim bukti pembayaran sebelum batas waktu supaya order tidak dibatalkan otomatis."
+        ),
+        _plain_separator(),
+        discord.ui.TextDisplay("-# Sudah bayar? Kirim bukti transfernya, tim kami akan segera memverifikasi."),
+        accent_colour=COLOR_WARNING,
+    )
+
+
+# -- Roblox Trade Checker (/tradecheck) --------------------------------------
+# Verdict -> (label, aksen, kata penjelas). Semua indikator pake emoji custom
+# server (bot.core.emojis), gak ada emoji Unicode.
+_TRADE_VERDICTS = {
+    "eligible": ("LAYAK TRADE", COLOR_SUCCESS, EMOJI_SUCCESS),
+    "blocked": ("BELUM LAYAK", COLOR_DANGER, EMOJI_ERROR),
+    "review": ("PERLU VERIFIKASI", COLOR_WARNING, EMOJI_INFO),
+}
+_TRADE_STATE_EMOJI = {"ok": EMOJI_SUCCESS, "bad": EMOJI_ERROR, "unknown": EMOJI_INFO}
+_ITEM_NAME_MAX = 38
+
+
+def _short(text: str, limit: int = _ITEM_NAME_MAX) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
+
+
+def roblox_trade_check_container(card: dict, *, staff_view: bool = False) -> discord.ui.Container:
+    """Kartu hasil /tradecheck (data dari bot.utils.roblox_trade_check.
+    result_to_card). Urutan, dipisah garis: header verdict (avatar di
+    kanan) -> Syarat Trade (4 baris status) -> Inventory Limited (RAP/Value)
+    -> Item Terbaik -> Item Tumbal -> Catatan -> footer.
+
+    `staff_view`=True nambahin blok "Catatan Staff" (info teknis: cookie
+    belum diatur dll) yang GAK boleh keliatan pembeli.
+
+    Total teks sengaja dijaga jauh di bawah batas 4000 karakter Components
+    V2: nama item dipotong, daftar item dibatasi."""
+    profile = card["profile"]
+    label, accent, indicator = _TRADE_VERDICTS[card["verdict"]]
+    verified = " (verified)" if profile.get("has_verified_badge") else ""
+
+    def separator() -> discord.ui.Separator:
+        return discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+
+    header_text = discord.ui.TextDisplay(
+        f"-# {FOOTER_TEXT}  \u00b7  TRADE CHECKER\n"
+        f"## {indicator} {label}\n"
+        f"**{profile['display_name']}** (@{profile['name']}){verified}  \u00b7  ID {profile['id']}\n"
+        f"{card['headline']}"
+    )
+    children: list = [
+        discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(media=profile["avatar_url"]))
+        if profile.get("avatar_url")
+        else header_text,
+        separator(),
+    ]
+
+    # -- Syarat Trade
+    row_lines = ["### Syarat Trade"]
+    for row in card["rows"]:
+        row_lines.append(f"{_TRADE_STATE_EMOJI[row['state']]} **{row['label']}** : {row['text']}")
+    children.append(discord.ui.TextDisplay("\n".join(row_lines)))
+
+    # -- Inventory Limited (cuma kalau inventory publik -- kalau privat, RAP/Value emang gak bisa dihitung)
+    if card["visibility"] == "public":
+        stats = card["stats"]
+        children.append(separator())
+        children.append(discord.ui.TextDisplay("\n".join([
+            "### Inventory Limited",
+            f"{MARK_BULLET} **Total Limited** : {stats['total_items']:,} item ({stats['unique_items']:,} unik)",
+            f"{MARK_BULLET} **Total RAP** : {stats['total_rap']:,} R$",
+            f"{MARK_BULLET} **Total Value** : {stats['total_value']:,} R$",
+        ])))
+
+        if card["top_items"]:
+            top_lines = ["### Item Terbaik"]
+            for index, item in enumerate(card["top_items"], start=1):
+                tags = ""
+                if item["serial"] is not None:
+                    tags += f" \u00b7 #{item['serial']}"
+                if item["count"] > 1:
+                    tags += f" \u00b7 x{item['count']}"
+                if item["projected"]:
+                    tags += " \u00b7 **PROJECTED**"
+                value_text = f"Value {item['value']:,}" if item["valued"] else "belum di-value"
+                top_lines.append(
+                    f"{index}. **{_short(item['name'])}**{tags}\n"
+                    f"-# RAP {item['rap']:,}  \u00b7  {value_text}"
+                )
+            children.append(separator())
+            children.append(discord.ui.TextDisplay("\n".join(top_lines)))
+
+        if card["tumbal_items"]:
+            tumbal_lines = ["### Item Tumbal (termurah)"]
+            for index, item in enumerate(card["tumbal_items"], start=1):
+                serial = f" \u00b7 #{item['serial']}" if item["serial"] is not None else ""
+                copies = f" \u00b7 x{item['count']}" if item.get("count", 1) > 1 else ""
+                rap_text = f"RAP {item['rap']:,}" if item["rap"] else "RAP belum ada"
+                tumbal_lines.append(f"{index}. **{_short(item['name'])}**{serial}{copies}  \u00b7  {rap_text}")
+            note = (
+                "-# Terverifikasi Roblox sebagai item yang bisa di-trade."
+                if card["tumbal_confirmed"]
+                else "-# Dari inventory publik; status bisa-di-trade belum diverifikasi resmi."
+            )
+            tumbal_lines.append(note)
+            children.append(separator())
+            children.append(discord.ui.TextDisplay("\n".join(tumbal_lines)))
+
+    # -- Catatan: hal yang harus diperbaiki / belum bisa dipastikan
+    # Penghalang PERTAMA udah tampil sebagai kalimat headline di atas --
+    # di sini cuma penghalang tambahan (kalau ada) + hal yang belum pasti.
+    notes: list[str] = [f"{MARK_BULLET} {line}" for line in card["blockers"][1:]]
+    notes.extend(f"{MARK_BULLET} {line}" for line in card["warnings"])
+    if notes:
+        children.append(separator())
+        children.append(discord.ui.TextDisplay("\n".join(["### Catatan", *notes])))
+
+    if staff_view and card["staff_notes"]:
+        children.append(separator())
+        children.append(discord.ui.TextDisplay(
+            "\n".join(["### Catatan Staff", *(f"-# {line}" for line in card["staff_notes"])])
+        ))
+
+    children.append(separator())
+    children.append(discord.ui.TextDisplay(
+        f"-# Data: Roblox & Rolimons  \u00b7  Dicek <t:{card['checked_at']}:R>\n"
+        "-# RAP dan Value adalah estimasi pasar, bukan jaminan harga."
+    ))
+    return discord.ui.Container(*children, accent_colour=accent)
+
+
+def roblox_check_panel_container() -> discord.ui.Container:
+    """Panel publik "Cek Akun Trade" -- ditaruh di channel Roblox, pembeli
+    klik tombolnya (ditambahin pemanggil di bot.ui.roblox_check_view) buat
+    ngecek akun sendiri. Hasilnya ephemeral, cuma keliatan si pengklik."""
+    def separator() -> discord.ui.Separator:
+        return discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+
+    return discord.ui.Container(
+        discord.ui.TextDisplay(
+            f"-# {FOOTER_TEXT}  \u00b7  TRADE CHECKER\n"
+            f"## {EMOJI_INFO} Cek Akun Trade\n"
+            "Mau beli limited lewat trade? Cek dulu akun Roblox-mu sudah memenuhi syarat."
+        ),
+        separator(),
+        discord.ui.TextDisplay(
+            "\n".join([
+                f"{MARK_BULLET} Inventory publik atau privat",
+                f"{MARK_BULLET} Total RAP dan Value inventory",
+                f"{MARK_BULLET} Item tumbal (limited termurah milikmu)",
+                f"{MARK_BULLET} Status izin trade (Plus/Premium)",
+            ])
+        ),
+        separator(),
+        discord.ui.TextDisplay(
+            "Klik tombol di bawah lalu masukkan username Roblox-mu. Hasilnya hanya terlihat olehmu.\n"
+            "-# Pastikan inventory-mu publik supaya bisa dicek."
+        ),
+        accent_colour=COLOR_ACCENT,
+    )
+
+
+def roblox_profile_container(profile: dict, title_emoji: str = "\U0001F3AE") -> discord.ui.Container:
+    """Isi kartu hasil /checkprofile -- tata letak PERSIS yang diminta:
+    judul -> pemisah -> avatar Roblox (gede, MediaGallery bukan
+    thumbnail kecil) -> pemisah -> data profil (username/display name/
+    tanggal dibuat/User ID) -> pemisah -> footer. Data ASLI dari Roblox
+    API (bot.utils.roblox_api), bukan checker abal-abal. GAK ada saldo
+    Robux -- itu emang gak pernah bisa dicek buat akun orang lain
+    (Roblox gak expose itu ke publik), jadi field itu dibuang total
+    daripada nampilin sesuatu yang gak bisa diisi jujur.
+
+    `title_emoji` boleh emoji custom server (diatur staff lewat
+    /checkprofile_emoji) -- default joystick unicode kalau belum diatur."""
+    verified = " \u2713" if profile.get("has_verified_badge") else ""
+    banned_note = "\n\u26A0\uFE0F **Akun ini KEBAN di Roblox.**" if profile.get("is_banned") else ""
+
+    children: list = [
+        discord.ui.TextDisplay(f"## {title_emoji} Roblox Profile Checker"),
+        discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+    ]
+
+    if profile.get("avatar_url"):
+        children.append(discord.ui.MediaGallery(discord.MediaGalleryItem(media=profile["avatar_url"])))
+        children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    detail_text = (
+        f"**Username:** @{profile['name']}{verified}\n"
+        f"**Display Name:** {profile['display_name']}\n"
+        f"**Tanggal Pembuatan:** {profile.get('created_display', '?')} ({profile.get('account_age_display', '')})\n"
+        f"**User ID:** {profile['id']}"
+        f"{banned_note}"
+    )
+    children.append(discord.ui.TextDisplay(detail_text))
+    children.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    children.append(discord.ui.TextDisplay("-# Roblox Profile Checker \u2014 by Noctra Digital Store"))
+
+    return discord.ui.Container(*children, accent_colour=COLOR_ACCENT)
