@@ -1,0 +1,566 @@
+-- NOCTRA database schema. SQLite now; columns/types chosen to migrate
+-- cleanly to Postgres/MySQL later (explicit TEXT timestamps, no SQLite-only
+-- tricks beyond AUTOINCREMENT).
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS categories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    description TEXT,
+    emoji       TEXT,
+    position    INTEGER NOT NULL DEFAULT 0,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Sits between Category and Product (Category -> Category Type -> Product).
+-- Replaces the old per-product "variant" concept: instead of one product
+-- having several priced sub-options, products are grouped under a type and
+-- each product is its own fully independent, fully priced item.
+CREATE TABLE IF NOT EXISTS category_types (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    description TEXT,
+    emoji       TEXT,
+    position    INTEGER NOT NULL DEFAULT 0,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Product Type (OPSIONAL) -- level antara Category Type dan Product
+-- (Category -> Category Type -> Product Type -> Product). Dipake kalau
+-- sebagian produk di satu Category Type perlu dikelompokin lagi (misal
+-- Robux: Via Username / Via Login / Gamepass). Category Type yang gak punya
+-- Product Type tetep jalan persis kayak sebelumnya.
+--
+-- Stok bisa DIGABUNG di level ini (shared_stock = 1): semua produk di
+-- bawah Product Type narik dari SATU pool yang sama, misal pool Robux
+-- 10.000 yang kepotong tiap ada yang beli paket 100/500/1000 Robux.
+-- stock_mode: unit (satuan, habis 1 per qty) | amount (jumlah, habis
+-- sesuai products.stock_cost x qty). Lihat bot.utils.stock.
+CREATE TABLE IF NOT EXISTS product_groups (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_type_id  INTEGER NOT NULL REFERENCES category_types(id) ON DELETE CASCADE,
+    name              TEXT NOT NULL,
+    description       TEXT,
+    emoji             TEXT,
+    position          INTEGER NOT NULL DEFAULT 0,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    shared_stock      INTEGER NOT NULL DEFAULT 0,
+    stock_mode        TEXT NOT NULL DEFAULT 'unit',     -- unit | amount
+    stock_quantity    INTEGER NOT NULL DEFAULT 0,
+    stock_label       TEXT,                              -- misal "Robux" (cuma buat tampilan)
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS products (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_type_id  INTEGER NOT NULL REFERENCES category_types(id) ON DELETE CASCADE,
+    name              TEXT NOT NULL,
+    description       TEXT,
+    image_url         TEXT,
+    emoji             TEXT,
+    product_type      TEXT NOT NULL DEFAULT 'manual',     -- manual | automatic | digital | service
+    stock_type        TEXT NOT NULL DEFAULT 'unlimited',  -- unlimited | manual
+    stock_quantity    INTEGER NOT NULL DEFAULT 0,
+    product_group_id  INTEGER REFERENCES product_groups(id) ON DELETE SET NULL,  -- NULL = gak masuk Product Type manapun
+    stock_mode        TEXT NOT NULL DEFAULT 'unit',       -- unit | amount (cuma kepake kalau stock_type = manual)
+    stock_cost        INTEGER NOT NULL DEFAULT 1,         -- stok yang kepake per 1 qty (mode amount, misal 800 buat paket 800 Robux)
+    stock_label       TEXT,                                -- misal "Robux"
+    visible           INTEGER NOT NULL DEFAULT 1,
+    base_price        REAL NOT NULL DEFAULT 0,
+    currency_label    TEXT NOT NULL DEFAULT 'USD',
+    discount_type     TEXT,                                -- NULL | percent | flat
+    discount_value    REAL NOT NULL DEFAULT 0,
+    position          INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Dynamic checkout fields now live on the category TYPE, not the product --
+-- every product under a type automatically shares the same set of fields,
+-- so you configure them once per type instead of once per product.
+CREATE TABLE IF NOT EXISTS product_fields (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_type_id  INTEGER NOT NULL REFERENCES category_types(id) ON DELETE CASCADE,
+    -- NULL = field Category Type (berlaku buat SEMUA produk di tipe itu).
+    -- Terisi = field TAMBAHAN khusus Product Type itu (opsional); category_type_id
+    -- tetep diisi tipe induk Product Type-nya.
+    product_group_id  INTEGER REFERENCES product_groups(id) ON DELETE CASCADE,
+    label             TEXT NOT NULL,
+    field_type        TEXT NOT NULL DEFAULT 'custom',  -- username|userid|login|email|password|serverid|gameid|custom
+    required          INTEGER NOT NULL DEFAULT 1,
+    placeholder       TEXT,
+    min_length        INTEGER NOT NULL DEFAULT 0,
+    max_length        INTEGER NOT NULL DEFAULT 100,
+    validation        TEXT NOT NULL DEFAULT 'none',    -- none|numeric|alpha|alphanumeric|email
+    position          INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS payment_methods (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT NOT NULL,
+    instructions     TEXT,
+    image_url        TEXT,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    timeout_minutes  INTEGER NOT NULL DEFAULT 30,
+    position         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER NOT NULL,
+    product_id          INTEGER NOT NULL REFERENCES products(id),
+    payment_method_id   INTEGER REFERENCES payment_methods(id),
+    unit_price          REAL NOT NULL,
+    total_price         REAL NOT NULL,
+    currency_label      TEXT NOT NULL DEFAULT 'USD',
+    status              TEXT NOT NULL DEFAULT 'pending',   -- pending|processing|completed|cancelled|refunded
+    payment_status      TEXT NOT NULL DEFAULT 'pending',   -- pending|paid|expired|cancelled
+    stock_reserved      INTEGER NOT NULL DEFAULT 0,
+    ticket_channel_id   INTEGER,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    payment_deadline    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_field_values (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id  INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    label     TEXT NOT NULL,
+    field_type TEXT NOT NULL DEFAULT 'custom',
+    value     TEXT
+);
+
+-- Isi order (keranjang multi-produk). SATU baris per produk per order.
+-- orders.product_id tetep keisi produk PERTAMA biar semua fitur lama yang
+-- baca orders.product_id (review, statistik, dst) tetep jalan; yang ngerti
+-- multi-item baca tabel ini. product_name di-snapshot biar riwayat gak
+-- rusak kalau produknya diganti nama/dihapus. stock_source/stock_source_id/
+-- stock_used nyimpen PERSIS stok apa yang kepotong, jadi cancel/refund/
+-- expire balikin jumlah yang bener walau stock_cost produknya udah berubah.
+CREATE TABLE IF NOT EXISTS order_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id         INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    product_id       INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    product_name     TEXT NOT NULL,
+    quantity         INTEGER NOT NULL DEFAULT 1,
+    unit_price       REAL NOT NULL,
+    line_total       REAL NOT NULL,
+    stock_source     TEXT NOT NULL DEFAULT 'none',       -- none | product | group
+    stock_source_id  INTEGER,
+    stock_used       INTEGER NOT NULL DEFAULT 0
+);
+
+-- Keranjang per user (global, bukan per-guild -- toko emang satu). Disimpen
+-- di DB biar gak ilang pas bot restart atau view-nya timeout.
+CREATE TABLE IF NOT EXISTS cart_items (
+    user_id     INTEGER NOT NULL,
+    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    quantity    INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, product_id)
+);
+
+-- Messages NOCTRA sent in the customer's DM during checkout for this order
+-- (order summary, payment instructions, etc.) -- tracked so they can be
+-- cleaned up automatically once the order is marked completed, instead of
+-- piling up in the customer's DM forever.
+CREATE TABLE IF NOT EXISTS order_dm_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id          INTEGER REFERENCES orders(id),
+    user_id           INTEGER NOT NULL,
+    channel_id        INTEGER NOT NULL UNIQUE,
+    kind              TEXT NOT NULL DEFAULT 'order',   -- order | support
+    status            TEXT NOT NULL DEFAULT 'open',    -- open | closed | archived
+    close_reason      TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    closed_at         TEXT,
+    last_activity_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id             INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    product_id           INTEGER NOT NULL REFERENCES products(id),
+    user_id              INTEGER NOT NULL,
+    rating               INTEGER NOT NULL,
+    review_text          TEXT,
+    image_url            TEXT,
+    anonymous            INTEGER NOT NULL DEFAULT 0,
+    status               TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected|hidden
+    awaiting_photo       INTEGER NOT NULL DEFAULT 0,
+    awaiting_photo_since TEXT,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
+
+-- Isi tombol "Reply" yang ditambahin lewat /panel atau /announcement --
+-- beda sama tombol link (yang cuma nyimpen URL langsung di komponen
+-- pesannya), tombol reply butuh nyimpen teks balasannya di sini biar bisa
+-- dipanggil balik pas diklik, bahkan abis bot restart (custom_id-nya cuma
+-- nyimpen ID row ini, bukan teksnya langsung).
+CREATE TABLE IF NOT EXISTS panel_reply_buttons (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    label          TEXT NOT NULL,
+    reply_text     TEXT NOT NULL,
+    image_url      TEXT,
+    thumbnail_url  TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Kartu digital NOCTRA -- saldo Credit (dari deposit customer, dipake
+-- checkout), Noctoins (didapet dari transaksi bayar pake Credit, bisa jadi
+-- potongan harga), dan Server Points (statistik seberapa sering belanja
+-- pake card, gak bisa di-redeem). card_id itu serial/referensi doang buat
+-- kebutuhan support -- BUKAN kredensial: semua aksi (cek saldo, isi saldo)
+-- selalu ke-tie ke akun Discord yang invoke, bukan berdasarkan ID yang
+-- diketik siapapun (lihat bot.utils.card_actions).
+CREATE TABLE IF NOT EXISTS cards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL UNIQUE,
+    card_id         TEXT NOT NULL UNIQUE,
+    credit_balance  REAL NOT NULL DEFAULT 0,
+    noctoins        INTEGER NOT NULL DEFAULT 0,
+    server_points   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Permintaan bikin kartu baru / isi saldo yang nunggu approve staff --
+-- alurnya mirip bot.cogs.payment_proof (customer DM bukti transfer), tapi
+-- kepisah total dari orders soalnya kartu bukan produk. Status:
+-- awaiting_proof (modal disubmit, nunggu customer kirim screenshot) ->
+-- pending (foto masuk, nunggu keputusan staff) -> approved | rejected.
+CREATE TABLE IF NOT EXISTS card_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    kind        TEXT NOT NULL,                    -- create | topup
+    amount      REAL NOT NULL,
+    admin_fee   REAL NOT NULL DEFAULT 0,           -- cuma keisi buat kind=create
+    proof_url   TEXT,
+    status      TEXT NOT NULL DEFAULT 'awaiting_proof',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT
+);
+
+-- Draft pesan /panel yang kesimpen (title/description/blocks/tombol/dst,
+-- serialized JSON) -- biar staff bisa lanjutin edit pesan panel yang
+-- udah keposting KAPAN AJA (lewat /panel message:<link/ID>), gak cuma
+-- sekali sesi doang selagi PanelBuilderView masih nyangkut di memori.
+-- Ke-update tiap ada perubahan draft, lihat bot.ui.panel_builder.
+CREATE TABLE IF NOT EXISTS panel_drafts (
+    message_id  INTEGER PRIMARY KEY,
+    channel_id  INTEGER NOT NULL,
+    draft_json  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Giveaway. Tombol Join persistent (custom_id encode giveaway_id doang,
+-- gaya tombol -- label/warna/emoji -- direkonstruksi dari row ini tiap
+-- restart, sama triknya kayak card_requests). status: active -> ended.
+-- win_role_id opsional -- kalau diisi, otomatis di-assign ke user_id
+-- pemenang pas giveaway berakhir (lihat bot.utils.giveaway_actions).
+CREATE TABLE IF NOT EXISTS giveaways (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id          INTEGER NOT NULL,
+    channel_id        INTEGER NOT NULL,
+    message_id        INTEGER,
+    host_user_id      INTEGER NOT NULL,
+    title             TEXT NOT NULL,
+    description       TEXT,
+    prize             TEXT NOT NULL,
+    winner_count      INTEGER NOT NULL DEFAULT 1,
+    win_role_id       INTEGER,
+    button_label      TEXT NOT NULL DEFAULT 'Ikut Giveaway',
+    button_style      TEXT NOT NULL DEFAULT 'primary',  -- primary|secondary|success|danger
+    button_emoji      TEXT,
+    color             INTEGER,
+    status            TEXT NOT NULL DEFAULT 'active',   -- active|ended
+    ends_at           TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS giveaway_entries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id   INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+    user_id       INTEGER NOT NULL,
+    entered_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(giveaway_id, user_id)
+);
+
+-- Dipisah dari giveaway_entries (bukan sekadar flag di situ) biar
+-- /giveaway reroll bisa nimpa daftar pemenang tanpa ilangin data siapa
+-- aja yang tadinya ikutan.
+CREATE TABLE IF NOT EXISTS giveaway_winners (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id   INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+    user_id       INTEGER NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Bukti pengiriman barang yang diposting staff lewat /shipment kirim --
+-- disimpen buat riwayat/audit (/shipment log), BUKAN alur approval kayak
+-- reviews/card_requests -- begitu diposting langsung final, gak ada
+-- status pending/approved di sini.
+CREATE TABLE IF NOT EXISTS shipment_proofs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id          INTEGER NOT NULL,
+    channel_id        INTEGER NOT NULL,
+    message_id        INTEGER,
+    staff_user_id     INTEGER NOT NULL,
+    customer_user_id  INTEGER NOT NULL,
+    category          TEXT NOT NULL DEFAULT '',
+    product           TEXT NOT NULL DEFAULT '',
+    shipped_date      TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    photo_url         TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Jenis-jenis ticket per server (Customer Service, Konsultasi, dst) --
+-- staff atur lewat /ticket type add. `slug` dipake sebagai `kind` di
+-- tabel tickets & prefix nama channel, jadi divalidasi lowercase/
+-- slug-safe di bot.cogs.ticket sebelum disimpen ke sini.
+-- category_id/archive_category_id/log_channel_id BOLEH kosong -- kalau
+-- kosong, bot.utils.ticket_actions fallback ke setting global (/settings)
+-- kayak sebelum fitur ini ada, jadi "support" bawaan tetep aman.
+CREATE TABLE IF NOT EXISTS ticket_types (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id              INTEGER NOT NULL,
+    slug                  TEXT NOT NULL,
+    label                 TEXT NOT NULL,
+    description           TEXT,
+    emoji                 TEXT,
+    category_id           INTEGER,
+    archive_category_id   INTEGER,
+    log_channel_id        INTEGER,
+    position              INTEGER NOT NULL DEFAULT 0,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(guild_id, slug)
+);
+
+-- Badge custom leaderboard Top Spenders -- teks bebas + gradient 2 warna
+-- yang user atur sendiri lewat panel /badge (CUMA berlaku buat top 1-3,
+-- dicek ulang tiap refresh -- lihat bot.cogs.badge & bot.ui.views.
+-- BadgePanelView), digambar langsung ke PNG leaderboard
+-- (bot.utils.leaderboard_image), bukan komponen Discord.
+-- UNIQUE(user_id) -- satu user cuma bisa punya satu badge aktif, set_badge
+-- (bot.database.queries.leaderboard) pake ON CONFLICT(user_id) DO UPDATE.
+CREATE TABLE IF NOT EXISTS leaderboard_badges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL UNIQUE,
+    text        TEXT NOT NULL,
+    color_from  TEXT NOT NULL,
+    color_to    TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Invite tracker -- dipake buat event berhadiah "siapa invite paling
+-- banyak". Dua tabel:
+--   * invite_links: override kepemilikan invite code yang di-GENERATE BOT
+--     lewat tombol "Generate Link Server" di panel -- WAJIB, soalnya kalau
+--     bot yang manggil create_invite(), field invite.inviter dari Discord
+--     bakal keisi akun BOT itu sendiri, bukan user yang klik tombolnya.
+--     Invite yang dibikin manual staff lewat UI Discord (bukan lewat bot)
+--     gak perlu masuk sini -- attribution-nya diambil langsung dari
+--     invite.inviter yang beneran akurat buat kasus itu (lihat
+--     bot.cogs.invite_tracker.on_member_join).
+--   * invite_members: SATU baris per (guild, member) yang lagi/pernah
+--     ke-track -- active=1 selama member itu masih di server. Pas member
+--     keluar, active jadi 0 (bukan dihapus, histori tetep ada), jadi
+--     ranking top inviter (SUM WHERE active=1) otomatis turun kalau
+--     member yang dia invite keluar -- ini yang bikin anti-curang-nya
+--     jalan tanpa job terjadwal, cukup listener on_member_remove.
+CREATE TABLE IF NOT EXISTS invite_links (
+    code        TEXT PRIMARY KEY,
+    guild_id    INTEGER NOT NULL,
+    owner_id    INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS invite_members (
+    guild_id    INTEGER NOT NULL,
+    member_id   INTEGER NOT NULL,
+    inviter_id  INTEGER NOT NULL,
+    invite_code TEXT,
+    joined_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    left_at     TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, member_id)
+);
+
+-- Katalog item Roblox limited -- SATU panel, geser Sebelumnya/Selanjutnya
+-- buat pindah ANTAR ITEM (beda item, beda gambar, beda stock/harga, beda
+-- link -- BUKAN banyak foto dari satu item yang sama). Staff nambahin
+-- item satu-satu lewat /roblox item add, makanya item kepisah ke tabel
+-- sendiri (satu katalog bisa punya banyak item). current_index nyimpen
+-- item ke berapa yang lagi ditampilin -- SATU state per katalog yang
+-- keliatan sama buat SEMUA orang yang liat channel-nya (bukan
+-- per-viewer), lihat bot.ui.views.RobloxSlideButton.
+CREATE TABLE IF NOT EXISTS roblox_catalogs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id      INTEGER NOT NULL,
+    panel_title   TEXT NOT NULL DEFAULT 'KATALOG ITEM LIMITED',
+    current_index INTEGER NOT NULL DEFAULT 0,
+    channel_id    INTEGER,
+    message_id    INTEGER,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS roblox_catalog_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    catalog_id  INTEGER NOT NULL REFERENCES roblox_catalogs(id) ON DELETE CASCADE,
+    item_title  TEXT NOT NULL,
+    image_url   TEXT NOT NULL,
+    stock_info  TEXT NOT NULL,
+    link_label  TEXT NOT NULL DEFAULT 'Beli Sekarang',
+    link_url    TEXT NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- State panel toko (/settings shop_panel) -- disimpen biar footer "Terakhir
+-- update" bisa di-refresh OTOMATIS tiap 10 detik (lihat
+-- bot.cogs.shop_panel_task) tanpa staff perlu posting ulang manual, dan
+-- biar tetep jalan abis bot restart. SATU baris per guild -- posting
+-- ulang /settings shop_panel di guild yang sama NIMPA baris ini (bukan
+-- nambah baris baru), soalnya cuma SATU panel toko yang dianggep
+-- "aktif" per server.
+CREATE TABLE IF NOT EXISTS shop_panel_state (
+    guild_id      INTEGER PRIMARY KEY,
+    channel_id    INTEGER NOT NULL,
+    message_id    INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    banner_url    TEXT,
+    thumbnail_url TEXT,
+    button_label  TEXT NOT NULL,
+    button_emoji  TEXT,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Sticky message: pesan yang selalu nempel di PALING BAWAH channel. Tiap ada
+-- pesan baru, bot kirim ulang sticky-nya ke bawah dan hapus yang lama
+-- (lihat bot.cogs.sticky). SATU sticky per channel (channel_id UNIQUE).
+-- message_id = pesan sticky yang lagi terpasang sekarang (NULL = belum/ga
+-- terpasang); enabled = 0 nyimpen konfigurasinya tapi sticky-nya dicopot.
+CREATE TABLE IF NOT EXISTS sticky_messages (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id       INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL UNIQUE,
+    title          TEXT NOT NULL,
+    description    TEXT NOT NULL,
+    footer_text    TEXT,
+    thumbnail_url  TEXT,
+    accent_color   INTEGER,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    message_id     INTEGER,
+    created_by     INTEGER,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Auto reaction: bot otomatis nambahin reaksi emoji ke pesan baru di sebuah
+-- channel (lihat bot.cogs.autoreact). SATU konfigurasi per channel.
+-- emojis = JSON list (urut = urutan reaksi ditambahin; unicode atau
+-- "<:nama:id>" buat emoji custom). filter_mode: all | media | links.
+CREATE TABLE IF NOT EXISTS auto_reactions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id      INTEGER NOT NULL,
+    channel_id    INTEGER NOT NULL UNIQUE,
+    emojis        TEXT NOT NULL,
+    filter_mode   TEXT NOT NULL DEFAULT 'all',
+    ignore_bots   INTEGER NOT NULL DEFAULT 1,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_by    INTEGER,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Pengaturan "Produk Lainnya" (order produk di luar katalog). SATU baris
+-- (id = 1). Produknya sendiri produk SISTEM tersembunyi (product_id) yang
+-- field form-nya diatur lewat Catalog Builder -- jadi alur checkout-nya
+-- SAMA PERSIS dengan produk biasa. price_mode: input (customer isi nominal,
+-- dengan batas min/maks) | fixed (pakai fixed_price). Lihat bot.utils.custom_order.
+CREATE TABLE IF NOT EXISTS custom_order_config (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled         INTEGER NOT NULL DEFAULT 0,
+    product_id      INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    label           TEXT NOT NULL DEFAULT 'Produk Lainnya',
+    description     TEXT,
+    emoji           TEXT,
+    price_mode      TEXT NOT NULL DEFAULT 'input',
+    fixed_price     REAL NOT NULL DEFAULT 0,
+    min_amount      REAL,
+    max_amount      REAL,
+    price_label     TEXT NOT NULL DEFAULT 'Nominal yang mau dibayar',
+    currency_label  TEXT,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Permintaan "Produk Lainnya" mode "staff tentukan harga": customer isi
+-- form -> staff kasih harga -> customer lanjut bayar lewat alur checkout
+-- biasa (baru JADI order di titik itu). status: pending (nunggu harga) ->
+-- priced (nunggu customer) -> ordering (lagi dibayar, kunci anti-dobel) ->
+-- ordered | rejected | cancelled. fields_json = jawaban form.
+CREATE TABLE IF NOT EXISTS custom_quotes (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL,
+    product_id        INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    fields_json       TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    price             REAL,
+    note              TEXT,
+    currency_label    TEXT,
+    staff_channel_id  INTEGER,
+    staff_message_id  INTEGER,
+    dm_channel_id     INTEGER,
+    dm_message_id     INTEGER,
+    order_id          INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Panel chat per-order di channel order-log -- SATU pesan per order yang
+-- di-EDIT (bukan bikin pesan baru) tiap ada balesan customer ATAU staff,
+-- biar channel order-log gak kebanjiran notif baru buat obrolan yang
+-- sama. `transcript` nyimpen histori teksnya (dipotong dari DEPAN kalau
+-- kepanjangan, lihat bot.utils.order_chat), `latest_image_url` nyimpen
+-- gambar TERBARU yang keliatan di panel (BEDA dari
+-- orders.payment_proof_url yang sengaja cuma nyimpen gambar PERTAMA).
+CREATE TABLE IF NOT EXISTS order_chat_panels (
+    order_id         INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+    channel_id       INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    transcript       TEXT NOT NULL DEFAULT '',
+    latest_image_url TEXT,
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Daftar teks status "Watching ..." bot yang gonta-ganti otomatis (lihat
+-- bot.cogs.presence_rotator). Diisi SEKALI dengan daftar default pas
+-- tabelnya masih kosong (lihat PresenceRotatorCog.cog_load) -- bukan
+-- lewat INSERT di sini, soalnya schema.sql cuma jalan sekali tiap
+-- startup dan gak boleh nimpa ulang teks yang staff udah ubah lewat
+-- /presence add|remove.
+CREATE TABLE IF NOT EXISTS bot_presence_statuses (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    text      TEXT NOT NULL,
+    position  INTEGER NOT NULL DEFAULT 0
+);
